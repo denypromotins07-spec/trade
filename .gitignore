@@ -1,58 +1,38 @@
 ```
-# Environment variables
+# Compiled Python files
+*.pyc
+__pycache__/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment files
 .env
 .env.local
 *.env.*
 
-# Python specific
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-.venv-bak/
-.venv-clone/
-.venv-copy/
-.venv-dup/
-.venv-test/
-.venv-dev/
-.venv-prod/
-.venv-staging/
-.venv-local/
-.venv-production/
-.venv-development/
-.venv-testing/
-.venv-build/
-.venv-deps/
-.venv-env/
-.venv-py/
-.venv-python/
-.venv-venv/
-.venv-virtual/
-.venv-virtualenv/
-.virtualenv/
-.venv-*/
-venv-*/
-env-*/
+# Editors
+.vscode/
+.idea/
 
-# Build artifacts
-target/
-build/
-dist/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
 
-# Logs
-*.log
-*.tmp
+# MyPy cache
+.mypy_cache/
 
-# OS generated files
-.DS_Store
-Thumbs.db
+# Pytest cache
+.pytest_cache/
 ```
