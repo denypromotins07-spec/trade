@@ -1,0 +1,58 @@
+```
+# Environment variables
+.env
+.env.local
+*.env.*
+
+# Python specific
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.venv-bak/
+.venv-clone/
+.venv-copy/
+.venv-dup/
+.venv-test/
+.venv-dev/
+.venv-prod/
+.venv-staging/
+.venv-local/
+.venv-production/
+.venv-development/
+.venv-testing/
+.venv-build/
+.venv-deps/
+.venv-env/
+.venv-py/
+.venv-python/
+.venv-venv/
+.venv-virtual/
+.venv-virtualenv/
+.virtualenv/
+.venv-*/
+venv-*/
+env-*/
+
+# Build artifacts
+target/
+build/
+dist/
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Logs
+*.log
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+```
