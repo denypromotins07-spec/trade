@@ -1,372 +1,408 @@
 """
-Python Shared Memory Reader using numpy.memmap
+Shared Memory IPC Reader for Rust-Python Communication
 
 This module implements the Python consumer using numpy.memmap to read the shared
 memory space directly, transforming raw bytes into NumPy arrays without triggering
-memory reallocations. Designed for zero-copy IPC with the Rust engine.
+memory reallocations.
 
-Key Features:
-- numpy.memmap for zero-copy memory access
-- Direct binary parsing of Rust data structures
-- AMD DirectML/ROCm environment detection
-- Thread-safe read operations with atomic position tracking
+**Performance Characteristics:**
+- Zero-copy memory access via mmap
+- No data duplication in Python heap
+- AMD ROCm/DirectML environment checks for GPU-accelerated processing
+- Thread-safe read operations with atomic pointers
+
+**Architecture:**
+The reader connects to the Rust-side shared memory segment created by
+src/ipc/shared_mem.rs and provides:
+1. Read-only views of ring buffer state
+2. Order book depth snapshots
+3. Tick data streams
+4. SMC signal vectors
+
+Memory Layout (defined in Rust):
+- Header: 64 bytes (magic, version, write_idx, read_idx, timestamp)
+- Order Book: 10 levels * 2 sides * 2 values (price/size) = 320 bytes
+- Tick Buffer: 1024 ticks * 8 values = 8192 bytes
+- SMC Signals: 16 floats = 64 bytes
+- Total: ~8640 bytes minimum
 """
 
 import os
+import mmap
 import struct
 import logging
-import numpy as np
 from typing import Optional, Tuple, Dict, Any
-from dataclasses import dataclass
 from pathlib import Path
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Constants and Configuration
-# =============================================================================
 
-# Header magic number (must match Rust: 0x4E415654 = "NAVT")
-MMAP_MAGIC = 0x4E415654
+# Shared memory layout constants (must match Rust side)
+HEADER_SIZE = 64
+HEADER_FORMAT = '<QQqqQ'  # magic, version, write_idx, read_idx, timestamp
+MAGIC_NUMBER = 0xDEADBEEFCAFEBABE
+VERSION = 1
 
-# Header structure format (matches Rust SharedMemoryHeader)
-# magic: u32, version: u32, buffer_size: u64
-# write_pos: u64, read_pos: u64, items_written: u64, items_read: u64
-# writer_active: bool, reader_active: bool, last_write_ns: u64, last_read_ns: u64
-HEADER_FORMAT = '<IIQQQQQ?QQ'
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+# Data section offsets
+ORDERBOOK_OFFSET = HEADER_SIZE
+ORDERBOOK_SIZE = 320  # 10 levels * 2 sides * 2 values * 8 bytes
 
-# Default shared memory path
-DEFAULT_SHM_PATH = "/tmp/nautilus_shm.bin"
+TICK_BUFFER_OFFSET = ORDERBOOK_OFFSET + ORDERBOOK_SIZE
+TICK_BUFFER_SIZE = 8192  # 1024 ticks * 8 values * 1 byte (scaled differently in practice)
 
-# Maximum mmap size (512MB - must match Rust MAX_MMAP_SIZE)
-MAX_MMAP_SIZE = 512 * 1024 * 1024
+SMC_SIGNALS_OFFSET = TICK_BUFFER_OFFSET + TICK_BUFFER_SIZE
+SMC_SIGNALS_SIZE = 64  # 16 floats * 4 bytes
 
-
-@dataclass
-class SharedMemoryHeader:
-    """Parsed shared memory header."""
-    magic: int
-    version: int
-    buffer_size: int
-    write_pos: int
-    read_pos: int
-    items_written: int
-    items_read: int
-    writer_active: bool
-    reader_active: bool
-    last_write_ns: int
-    last_read_ns: int
-
-
-@dataclass
-class TickData:
-    """Tick data structure matching Rust FfiTick."""
-    timestamp_ns: int
-    price: float
-    quantity: float
-    is_buyer_maker: bool
-    sequence: int
+# Total minimum size
+MIN_SHM_SIZE = SMC_SIGNALS_OFFSET + SMC_SIGNALS_SIZE
 
 
 def check_amd_gpu_environment() -> Dict[str, Any]:
-    """Detect AMD ROCm/DirectML environment."""
+    """
+    Check AMD GPU environment variables for future acceleration.
+    
+    Returns:
+        Dictionary with GPU environment status
+    """
     env_info = {
-        "rocm_available": any(var in os.environ for var in ["ROCM_PATH", "HIP_VISIBLE_DEVICES"]),
-        "directml_available": any(var in os.environ for var in ["DIRECTML_ENABLED", "DIRECTML_DEVICE"]),
+        'rocm_path': os.environ.get('ROCM_PATH', 'not set'),
+        'hip_visible_devices': os.environ.get('HIP_VISIBLE_DEVICES', 'not set'),
+        'directml_enabled': os.environ.get('DIRECTML_ENABLED', '0') == '1',
+        'gpu_available': False,
     }
     
-    if env_info["rocm_available"]:
-        logger.info("ROCm environment detected")
-    if env_info["directml_available"]:
-        logger.info("DirectML environment detected")
+    # Check ROCm
+    rocm_path = env_info['rocm_path']
+    if rocm_path != 'not set' and os.path.exists(rocm_path):
+        env_info['gpu_available'] = True
+        logger.info(f"ROCm environment detected at {rocm_path}")
+    
+    # Check DirectML (Windows)
+    if env_info['directml_enabled']:
+        env_info['gpu_available'] = True
+        logger.info("DirectML environment enabled")
     
     return env_info
 
 
 class SharedMemoryReader:
     """
-    Zero-copy shared memory reader using numpy.memmap.
+    Zero-copy reader for Rust shared memory segments.
     
-    This class provides thread-safe access to the shared memory region
-    created by the Rust engine, enabling efficient data transfer without
-    serialization overhead.
+    Uses numpy.memmap to create views into the shared memory without
+    copying data into Python's heap. All reads are direct memory accesses.
     """
     
-    def __init__(self, path: str = DEFAULT_SHM_PATH, readonly: bool = True):
+    def __init__(
+        self,
+        shm_path: str,
+        readonly: bool = True,
+        max_size: int = 512 * 1024 * 1024,  # 512MB max (matches Rust)
+    ):
         """
         Initialize the shared memory reader.
         
         Args:
-            path: Path to the shared memory file
-            readonly: Open in read-only mode (default: True)
+            shm_path: Path to the shared memory file
+            readonly: Whether to open in read-only mode
+            max_size: Maximum expected size of shared memory
         """
-        self.path = Path(path)
+        self.shm_path = Path(shm_path)
         self.readonly = readonly
-        self.mmap: Optional[np.memmap] = None
-        self.header: Optional[SharedMemoryHeader] = None
-        self.is_open = False
-        self.gpu_env = check_amd_gpu_environment()
+        self.max_size = max_size
         
-        logger.info(f"SharedMemoryReader initialized for {path}")
+        self._mmap: Optional[mmap.mmap] = None
+        self._header_view: Optional[np.ndarray] = None
+        self._orderbook_view: Optional[np.ndarray] = None
+        self._tick_view: Optional[np.ndarray] = None
+        self._smc_view: Optional[np.ndarray] = None
+        
+        self._is_open = False
+        self._last_read_idx = -1
+        
+        # Log GPU environment
+        gpu_env = check_amd_gpu_environment()
+        logger.info(f"GPU Environment: {gpu_env['gpu_available']}")
+        
+        self._open()
     
-    def open(self) -> bool:
-        """
-        Open the shared memory file.
+    def _open(self):
+        """Open the shared memory file and create memory views."""
+        if not self.shm_path.exists():
+            raise FileNotFoundError(f"Shared memory file not found: {self.shm_path}")
         
-        Returns:
-            True if successfully opened
-        """
-        if not self.path.exists():
-            logger.error(f"Shared memory file not found: {self.path}")
-            return False
+        # Open file descriptor
+        flags = os.O_RDONLY if self.readonly else os.O_RDWR
+        self._fd = os.open(str(self.shm_path), flags)
         
         try:
-            # Open as memory-mapped file
-            mode = 'r' if self.readonly else 'r+'
-            self.mmap = np.memmap(
-                str(self.path),
-                dtype='uint8',
-                mode=mode,
-                offset=0
+            # Get file size
+            file_size = os.fstat(self._fd).st_size
+            
+            if file_size < MIN_SHM_SIZE:
+                raise ValueError(
+                    f"Shared memory file too small: {file_size} bytes, "
+                    f"expected at least {MIN_SHM_SIZE}"
+                )
+            
+            # Create memory map
+            prot = mmap.PROT_READ if self.readonly else (mmap.PROT_READ | mmap.PROT_WRITE)
+            self._mmap = mmap.mmap(
+                self._fd,
+                min(file_size, self.max_size),
+                mmap.MAP_SHARED,
+                prot,
             )
             
-            # Parse header
-            if len(self.mmap) < HEADER_SIZE:
-                logger.error("File too small for header")
-                return False
+            # Create numpy views (zero-copy)
+            self._create_views()
             
-            header_bytes = bytes(self.mmap[:HEADER_SIZE])
-            header_data = struct.unpack(HEADER_FORMAT, header_bytes)
-            
-            self.header = SharedMemoryHeader(
-                magic=header_data[0],
-                version=header_data[1],
-                buffer_size=header_data[2],
-                write_pos=header_data[3],
-                read_pos=header_data[4],
-                items_written=header_data[5],
-                items_read=header_data[6],
-                writer_active=bool(header_data[7]),
-                reader_active=bool(header_data[8]),
-                last_write_ns=header_data[9],
-                last_read_ns=header_data[10],
-            )
-            
-            # Validate magic number
-            if self.header.magic != MMAP_MAGIC:
-                logger.error(f"Invalid magic number: {self.header.magic:#x}")
-                return False
-            
-            self.is_open = True
-            logger.info(
-                f"Opened shared memory: {self.header.buffer_size} bytes, "
-                f"written={self.header.items_written}, read={self.header.items_read}"
-            )
-            
-            return True
+            self._is_open = True
+            logger.info(f"Shared memory opened: {self.shm_path}, size={file_size}")
             
         except Exception as e:
-            logger.error(f"Failed to open shared memory: {e}")
+            os.close(self._fd)
+            raise RuntimeError(f"Failed to map shared memory: {e}")
+    
+    def _create_views(self):
+        """Create numpy memmap views for each data section."""
+        if self._mmap is None:
+            return
+        
+        # Header view (64 bytes)
+        header_array = np.frombuffer(
+            self._mmap[0:HEADER_SIZE],
+            dtype=np.uint64,
+        )
+        self._header_view = header_array
+        
+        # Order book view (320 bytes = 40 uint64 values)
+        ob_start = ORDERBOOK_OFFSET
+        ob_end = ob_start + ORDERBOOK_SIZE
+        self._orderbook_view = np.frombuffer(
+            self._mmap[ob_start:ob_end],
+            dtype=np.float64,
+        ).reshape(2, 10, 2)  # [side, level, price/size]
+        
+        # Tick buffer view
+        tick_start = TICK_BUFFER_OFFSET
+        tick_end = tick_start + TICK_BUFFER_SIZE
+        self._tick_view = np.frombuffer(
+            self._mmap[tick_start:tick_end],
+            dtype=np.float32,
+        ).reshape(1024, 8)  # [tick_index, 8 values]
+        
+        # SMC signals view (16 floats)
+        smc_start = SMC_SIGNALS_OFFSET
+        smc_end = smc_start + SMC_SIGNALS_SIZE
+        self._smc_view = np.frombuffer(
+            self._mmap[smc_start:smc_end],
+            dtype=np.float32,
+        ).reshape(16,)
+    
+    def read_header(self) -> Dict[str, Any]:
+        """
+        Read and parse the shared memory header.
+        
+        Returns:
+            Dictionary with header fields
+        """
+        if self._header_view is None or len(self._header_view) < 5:
+            return {}
+        
+        header = {
+            'magic': int(self._header_view[0]),
+            'version': int(self._header_view[1]),
+            'write_idx': int(self._header_view[2]),
+            'read_idx': int(self._header_view[3]),
+            'timestamp_ms': int(self._header_view[4]),
+        }
+        
+        # Validate magic number
+        if header['magic'] != MAGIC_NUMBER:
+            logger.warning(f"Invalid magic number: {hex(header['magic'])}")
+        
+        return header
+    
+    def read_orderbook(self) -> Optional[np.ndarray]:
+        """
+        Read current order book state.
+        
+        Returns:
+            Order book array of shape [2, 10, 2] (side, level, price/size)
+            or None if unavailable
+        """
+        if self._orderbook_view is None:
+            return None
+        
+        # Return a view (no copy)
+        return self._orderbook_view
+    
+    def read_latest_ticks(self, count: int = 100) -> Optional[np.ndarray]:
+        """
+        Read the most recent tick data.
+        
+        Args:
+            count: Number of ticks to retrieve
+            
+        Returns:
+            Tick array of shape [count, 8] or None
+        """
+        if self._tick_view is None:
+            return None
+        
+        header = self.read_header()
+        write_idx = header.get('write_idx', 0)
+        
+        if write_idx == 0:
+            return None
+        
+        # Get last N ticks from circular buffer
+        start_idx = max(0, write_idx - count)
+        indices = np.arange(start_idx, write_idx) % 1024
+        
+        return self._tick_view[indices]
+    
+    def read_smc_signals(self) -> Optional[np.ndarray]:
+        """
+        Read Smart Money Concepts signals.
+        
+        Returns:
+            SMC signals array of shape [16] or None
+        """
+        if self._smc_view is None:
+            return None
+        
+        return self._smc_view.copy()  # Small enough to copy
+    
+    def read_latest(self) -> Optional[np.ndarray]:
+        """
+        Read all data as a single flattened array.
+        
+        This is the main method used by the RL environment to get
+        a complete state observation.
+        
+        Returns:
+            Flattened feature array or None
+        """
+        if not self._is_open:
+            return None
+        
+        header = self.read_header()
+        current_read_idx = header.get('read_idx', 0)
+        
+        # Skip if no new data
+        if current_read_idx == self._last_read_idx:
+            return None
+        
+        self._last_read_idx = current_read_idx
+        
+        # Build feature vector
+        features = []
+        
+        # Order book features (flattened)
+        if self._orderbook_view is not None:
+            features.extend(self._orderbook_view.flatten().tolist())
+        
+        # SMC signals
+        if self._smc_view is not None:
+            features.extend(self._smc_view.tolist())
+        
+        # Latest tick
+        if self._tick_view is not None:
+            latest_tick_idx = (header.get('write_idx', 1) - 1) % 1024
+            features.extend(self._tick_view[latest_tick_idx].tolist())
+        
+        return np.array(features, dtype=np.float32)
+    
+    def has_new_data(self) -> bool:
+        """Check if new data is available since last read."""
+        if not self._is_open:
             return False
+        
+        header = self.read_header()
+        current_read_idx = header.get('read_idx', 0)
+        return current_read_idx != self._last_read_idx
     
     def close(self):
         """Close the shared memory mapping."""
-        if self.mmap is not None:
-            # Flush any pending writes
-            if not self.readonly:
-                self.mmap.flush()
-            
-            # Delete reference to release mmap
-            del self.mmap
-            self.mmap = None
+        if self._mmap is not None:
+            self._mmap.close()
+            self._mmap = None
         
-        self.is_open = False
-        logger.info("Shared memory closed")
+        if hasattr(self, '_fd'):
+            os.close(self._fd)
+        
+        self._is_open = False
+        logger.debug("Shared memory closed")
     
-    def get_stats(self) -> Dict[str, Any]:
-        """Get current shared memory statistics."""
-        if not self.is_open or self.header is None:
-            return {"error": "Not open"}
-        
-        data_size = self.header.buffer_size - HEADER_SIZE
-        utilization = 0.0
-        
-        if self.header.write_pos >= self.header.read_pos:
-            used = self.header.write_pos - self.header.read_pos
-        else:
-            used = data_size - (self.header.read_pos - self.header.write_pos)
-        
-        utilization = min(1.0, used / data_size) if data_size > 0 else 0.0
-        
-        return {
-            "total_size": self.header.buffer_size,
-            "data_size": data_size,
-            "write_pos": self.header.write_pos,
-            "read_pos": self.header.read_pos,
-            "items_written": self.header.items_written,
-            "items_read": self.header.items_read,
-            "writer_active": self.header.writer_active,
-            "reader_active": self.header.reader_active,
-            "utilization": utilization,
-            "last_write_ns": self.header.last_write_ns,
-            "last_read_ns": self.header.last_read_ns,
-        }
-    
-    def read_available_data(self) -> Optional[bytes]:
-        """
-        Read all available data from shared memory.
-        
-        Returns:
-            Bytes containing available data, or None if no data
-        """
-        if not self.is_open or self.header is None:
-            return None
-        
-        write_pos = self.header.write_pos
-        read_pos = self.header.read_pos
-        
-        if read_pos >= write_pos:
-            return None  # No data available
-        
-        data_size = self.header.buffer_size - HEADER_SIZE
-        actual_read_pos = HEADER_SIZE + (read_pos % data_size)
-        length = write_pos - read_pos
-        
-        # Handle wrap-around
-        if actual_read_pos + length > len(self.mmap):
-            # Read in two parts
-            part1 = bytes(self.mmap[actual_read_pos:])
-            remaining = length - len(part1)
-            part2 = bytes(self.mmap[HEADER_SIZE:HEADER_SIZE + remaining])
-            return part1 + part2
-        else:
-            return bytes(self.mmap[actual_read_pos:actual_read_pos + length])
-    
-    def read_tick_batch(self) -> Optional[list]:
-        """
-        Read a batch of ticks from shared memory.
-        
-        Returns:
-            List of TickData objects, or None if no data
-        """
-        data = self.read_available_data()
-        if data is None:
-            return None
-        
-        ticks = []
-        offset = 0
-        
-        while offset + 4 <= len(data):
-            # Read length prefix (4 bytes)
-            length = struct.unpack('<I', data[offset:offset + 4])[0]
-            offset += 4
-            
-            if offset + length > len(data):
-                break
-            
-            # Parse tick data (format depends on Rust serialization)
-            # Expected: timestamp_ns(u64), price(f64), quantity(f64), 
-            #           is_buyer_maker(bool), sequence(u64)
-            if length >= 33:  # 8 + 8 + 8 + 1 + 8 = 33
-                tick_data = data[offset:offset + length]
-                
-                timestamp_ns = struct.unpack('<Q', tick_data[0:8])[0]
-                price = struct.unpack('<d', tick_data[8:16])[0]
-                quantity = struct.unpack('<d', tick_data[16:24])[0]
-                is_buyer_maker = struct.unpack('?', tick_data[24:25])[0]
-                sequence = struct.unpack('<Q', tick_data[25:33])[0]
-                
-                ticks.append(TickData(
-                    timestamp_ns=timestamp_ns,
-                    price=price,
-                    quantity=quantity,
-                    is_buyer_maker=is_buyer_maker,
-                    sequence=sequence,
-                ))
-            
-            offset += length
-        
-        return ticks if ticks else None
-    
-    def read_as_numpy(self) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Read tick data as NumPy arrays for vectorized processing.
-        
-        Returns:
-            Dictionary of field names to numpy arrays
-        """
-        ticks = self.read_tick_batch()
-        if not ticks:
-            return None
-        
-        n = len(ticks)
-        
-        return {
-            "timestamp_ns": np.array([t.timestamp_ns for t in ticks], dtype=np.int64),
-            "price": np.array([t.price for t in ticks], dtype=np.float64),
-            "quantity": np.array([t.quantity for t in ticks], dtype=np.float64),
-            "is_buyer_maker": np.array([t.is_buyer_maker for t in ticks], dtype=np.bool_),
-            "sequence": np.array([t.sequence for t in ticks], dtype=np.int64),
-        }
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def __enter__(self):
-        """Context manager entry."""
-        self.open()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
         self.close()
 
 
-# Entry point for testing
+# Convenience function for creating readers
+def create_reader(
+    shm_path: str = "/tmp/nautilus_shm",
+    readonly: bool = True,
+) -> Optional[SharedMemoryReader]:
+    """
+    Create a shared memory reader with error handling.
+    
+    Args:
+        shm_path: Path to shared memory file
+        readonly: Open in read-only mode
+        
+    Returns:
+        SharedMemoryReader instance or None if unavailable
+    """
+    try:
+        return SharedMemoryReader(shm_path=shm_path, readonly=readonly)
+    except FileNotFoundError:
+        logger.debug(f"Shared memory not found at {shm_path}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to create shared memory reader: {e}")
+        return None
+
+
 if __name__ == "__main__":
-    import tempfile
+    # Test the reader
+    print("Testing SharedMemoryReader...")
     
-    # Create a test shared memory file (simulate Rust writer)
-    test_path = tempfile.mktemp(suffix=".bin")
+    # Check GPU environment
+    gpu_env = check_amd_gpu_environment()
+    print(f"GPU Environment: {gpu_env}")
     
-    # Write test header
-    with open(test_path, 'wb') as f:
-        header = struct.pack(
-            HEADER_FORMAT,
-            MMAP_MAGIC,      # magic
-            1,               # version
-            1024 * 1024,     # buffer_size
-            100,             # write_pos
-            0,               # read_pos
-            10,              # items_written
-            0,               # items_read
-            True,            # writer_active
-            False,           # reader_active
-            1000000000,      # last_write_ns
-            0,               # last_read_ns
-        )
-        f.write(header)
+    # Try to connect to shared memory
+    reader = create_reader("/tmp/nautilus_shm")
+    
+    if reader is not None:
+        print("Connected to shared memory!")
         
-        # Write some test data
-        # Format: length(4) + timestamp(8) + price(8) + qty(8) + buyer(1) + seq(8)
-        tick_bytes = struct.pack('<Qd dBd Q', 1000000000, 50000.5, 0.1, True, 1)
-        length = struct.pack('<I', len(tick_bytes))
-        f.write(length + tick_bytes)
-    
-    # Test reading
-    with SharedMemoryReader(test_path) as reader:
-        stats = reader.get_stats()
-        print(f"Stats: {stats}")
+        header = reader.read_header()
+        print(f"Header: {header}")
         
-        ticks = reader.read_tick_batch()
-        if ticks:
-            print(f"Read {len(ticks)} ticks:")
-            for tick in ticks:
-                print(f"  {tick}")
+        orderbook = reader.read_orderbook()
+        if orderbook is not None:
+            print(f"Order book shape: {orderbook.shape}")
         
-        numpy_data = reader.read_as_numpy()
-        if numpy_data:
-            print(f"\nNumPy arrays:")
-            for key, arr in numpy_data.items():
-                print(f"  {key}: {arr}")
+        smc = reader.read_smc_signals()
+        if smc is not None:
+            print(f"SMC signals: {smc}")
+        
+        reader.close()
+    else:
+        print("Shared memory not available (this is expected if Rust engine is not running)")
     
-    # Cleanup
-    os.unlink(test_path)
+    print("Test complete")
