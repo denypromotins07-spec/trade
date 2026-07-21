@@ -3,18 +3,19 @@
 *.pyc
 __pycache__/
 
+# Rust build artifacts
+target/
+Cargo.lock
+
 # Dependencies
 .venv/
 venv/
 node_modules/
 
-# Build artifacts
-dist/
-build/
-target/
-
-# Logs
+# Logs and temporary files
 *.log
+*.tmp
+*.swp
 
 # Environment files
 .env
@@ -25,7 +26,12 @@ target/
 .vscode/
 .idea/
 
-# Rust build artifacts
-Cargo.lock
-**/*.rs.bk
+# Coverage reports
+coverage/
+htmlcov/
+.coverage
+
+# Python cache
+.mypy_cache/
+.pytest_cache/
 ```
