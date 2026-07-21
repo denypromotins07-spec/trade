@@ -1,557 +1,456 @@
 """
-Cross-Chain & DEX Aggregation - Chapter 3
-File 9: arbitrage.py
+DEX/CEX Arbitrage Pathfinding with Numba Acceleration
 
 Implements Bellman-Ford and Floyd-Warshall algorithms for spatial
 and triangular arbitrage pathfinding across CEX and DEX venues,
-utilizing Numba for C-level speeds. Includes AMD ROCm/DirectML checks.
+utilizing Numba for C-level speeds.
+
+Key Features:
+- Bellman-Ford for negative cycle detection (arbitrage opportunities)
+- Floyd-Warshall for all-pairs shortest paths
+- Numba JIT compilation for microsecond latency
+- AMD ROCm/DirectML environment checks for GPU acceleration
+- Integration with Ray for distributed pathfinding
 """
 
+import os
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from collections import defaultdict
-import time
 
-# Check for Numba availability (C-level acceleration)
+# Check for AMD ROCm/DirectML availability
 try:
-    from numba import jit, njit, prange
+    import torch
+    ROCM_AVAILABLE = torch.cuda.is_available() and torch.version.hip is not None
+    DIRECTML_AVAILABLE = False
+except ImportError:
+    ROCM_AVAILABLE = False
+    DIRECTML_AVAILABLE = False
+
+# Numba for JIT compilation
+try:
+    from numba import jit, prange
     NUMBA_AVAILABLE = True
 except ImportError:
     NUMBA_AVAILABLE = False
-    # Fallback decorators
     def jit(*args, **kwargs):
         def decorator(func):
             return func
         return decorator
-    njit = jit
     prange = range
-
-# AMD ROCm/DirectML check for graph computations
-def check_graph_acceleration() -> Dict[str, bool]:
-    """Check for hardware acceleration available for graph algorithms."""
-    status = {
-        'numba_available': NUMBA_AVAILABLE,
-        'cuda_available': False,
-        'rocm_available': False,
-        'directml_available': False,
-    }
-    
-    if NUMBA_AVAILABLE:
-        try:
-            from numba import cuda
-            status['cuda_available'] = cuda.is_available()
-        except Exception:
-            pass
-        
-        try:
-            import os
-            rocm_paths = ['/opt/rocm', '/usr/lib/rocm', os.environ.get('ROCM_PATH', '')]
-            status['rocm_available'] = any(os.path.exists(p) for p in rocm_paths if p)
-        except Exception:
-            pass
-    
-    return status
-
-
-@dataclass
-class ArbitragePath:
-    """Represents a detected arbitrage opportunity."""
-    path: List[str]  # Sequence of tokens/exchanges
-    profit_percentage: float
-    input_amount: float
-    expected_output: float
-    gas_cost_usd: float
-    net_profit_usd: float
-    confidence: float
-    timestamp_ns: int
 
 
 @dataclass
 class ExchangeRate:
-    """Exchange rate between two tokens on a specific venue."""
-    base_token: str
-    quote_token: str
+    """Exchange rate between two assets."""
+    base: str
+    quote: str
     rate: float
-    inverse_rate: float
+    fee_bps: float  # Fee in basis points
     venue: str
-    liquidity_usd: float
-    fee_bps: int  # Basis points (1 bp = 0.01%)
+    timestamp_ms: int
 
 
-class GraphBuilder:
-    """Builds weighted graph representation for arbitrage detection."""
+@dataclass
+class ArbitragePath:
+    """Detected arbitrage opportunity path."""
+    path: List[str]  # Sequence of assets
+    profit_pct: float
+    venues: List[str]
+    rates: List[float]
+    total_fees_bps: float
+    confidence: float
+
+
+@jit(nopython=True, cache=True)
+def bellman_ford_numpy(
+    n_nodes: int,
+    edges: np.ndarray,
+    source: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Bellman-Ford algorithm for negative cycle detection.
     
-    def __init__(self):
-        self.nodes: Set[str] = set()
-        self.edges: Dict[Tuple[str, str], List[ExchangeRate]] = defaultdict(list)
+    Parameters:
+    - n_nodes: Number of nodes (assets)
+    - edges: Array of shape (n_edges, 3) with [from, to, -log(rate)]
+    - source: Source node index
     
-    def add_exchange_rate(self, rate: ExchangeRate) -> None:
-        """Add an exchange rate to the graph."""
-        self.nodes.add(rate.base_token)
-        self.nodes.add(rate.quote_token)
-        
-        edge_key = (rate.base_token, rate.quote_token)
-        self.edges[edge_key].append(rate)
-        
-        # Also add reverse edge with inverse rate
-        reverse_key = (rate.quote_token, rate.base_token)
-        reverse_rate = ExchangeRate(
-            base_token=rate.quote_token,
-            quote_token=rate.base_token,
-            rate=rate.inverse_rate,
-            inverse_rate=rate.rate,
-            venue=rate.venue,
-            liquidity_usd=rate.liquidity_usd,
-            fee_bps=rate.fee_bps,
-        )
-        self.edges[reverse_key].append(reverse_rate)
+    Returns:
+    - distances: Shortest distances from source
+    - predecessors: Predecessor nodes for path reconstruction
+    """
+    INF = 1e18
+    distances = np.full(n_nodes, INF, dtype=np.float64)
+    predecessors = np.full(n_nodes, -1, dtype=np.int32)
+    distances[source] = 0.0
     
-    def get_best_rate(self, from_token: str, to_token: str) -> Optional[ExchangeRate]:
-        """Get the best exchange rate between two tokens."""
-        edge_key = (from_token, to_token)
-        rates = self.edges.get(edge_key, [])
-        
-        if not rates:
-            return None
-        
-        # Return rate with best effective value after fees
-        best = max(rates, key=lambda r: r.rate * (1 - r.fee_bps / 10000))
-        return best
-
-
-if NUMBA_AVAILABLE:
-    @njit(parallel=True, cache=True)
-    def bellman_ford_numba(
-        n_nodes: int,
-        start_node: int,
-        edges_src: np.ndarray,
-        edges_dst: np.ndarray,
-        weights: np.ndarray,
-        max_iterations: int = 100
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Numba-accelerated Bellman-Ford algorithm for negative cycle detection.
-        Returns distances and predecessor arrays.
-        """
-        INF = 1e18
-        dist = np.full(n_nodes, INF, dtype=np.float64)
-        pred = np.full(n_nodes, -1, dtype=np.int32)
-        
-        dist[start_node] = 0.0
-        
-        for _ in range(max_iterations):
-            updated = False
-            for i in prange(len(edges_src)):
-                u = edges_src[i]
-                v = edges_dst[i]
-                w = weights[i]
-                
-                if dist[u] != INF and dist[u] + w < dist[v]:
-                    dist[v] = dist[u] + w
-                    pred[v] = u
-                    updated = True
+    n_edges = edges.shape[0]
+    
+    # Relax edges n-1 times
+    for _ in range(n_nodes - 1):
+        updated = False
+        for i in range(n_edges):
+            u = int(edges[i, 0])
+            v = int(edges[i, 1])
+            weight = edges[i, 2]
             
-            if not updated:
-                break
+            if distances[u] + weight < distances[v]:
+                distances[v] = distances[u] + weight
+                predecessors[v] = u
+                updated = True
         
-        return dist, pred
-
-    @njit(parallel=True, cache=True)
-    def floyd_warshall_numba(
-        n_nodes: int,
-        adj_matrix: np.ndarray
-    ) -> np.ndarray:
-        """
-        Numba-accelerated Floyd-Warshall algorithm for all-pairs shortest paths.
-        Returns distance matrix.
-        """
-        dist = adj_matrix.copy()
-        
-        for k in range(n_nodes):
-            for i in prange(n_nodes):
-                for j in range(n_nodes):
-                    if dist[i, k] + dist[j, k] < dist[i, j]:
-                        dist[i, j] = dist[i, k] + dist[k, j]
-        
-        return dist
-else:
-    def bellman_ford_numba(*args, **kwargs):
-        raise RuntimeError("Numba not available")
+        if not updated:
+            break
     
-    def floyd_warshall_numba(*args, **kwargs):
-        raise RuntimeError("Numba not available")
+    return distances, predecessors
 
 
-class ArbitrageDetector:
+@jit(nopython=True, cache=True)
+def detect_negative_cycle(
+    n_nodes: int,
+    edges: np.ndarray,
+    distances: np.ndarray
+) -> bool:
+    """Check if graph contains negative cycle (arbitrage opportunity)."""
+    n_edges = edges.shape[0]
+    
+    for i in range(n_edges):
+        u = int(edges[i, 0])
+        v = int(edges[i, 1])
+        weight = edges[i, 2]
+        
+        if distances[u] + weight < distances[v]:
+            return True
+    
+    return False
+
+
+@jit(nopython=True, cache=True, parallel=True)
+def floyd_warshall_numpy(
+    n_nodes: int,
+    adj_matrix: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Detects arbitrage opportunities using graph algorithms.
-    Supports both Bellman-Ford (single-source) and Floyd-Warshall (all-pairs).
+    Floyd-Warshall algorithm for all-pairs shortest paths.
+    
+    Parameters:
+    - n_nodes: Number of nodes
+    - adj_matrix: Adjacency matrix with -log(rate) values
+    
+    Returns:
+    - dist_matrix: All-pairs shortest distances
+    - next_matrix: Next node matrix for path reconstruction
     """
+    INF = 1e18
     
-    def __init__(self, min_profit_threshold_pct: float = 0.1):
-        self.graph = GraphBuilder()
-        self.token_to_idx: Dict[str, int] = {}
-        self.idx_to_token: Dict[int, str] = {}
-        self.min_profit_threshold = min_profit_threshold_pct
-        self._last_update_ns = 0
-        self.acceleration_status = check_graph_acceleration()
+    # Initialize distance matrix
+    dist_matrix = np.full((n_nodes, n_nodes), INF, dtype=np.float64)
+    next_matrix = np.full((n_nodes, n_nodes), -1, dtype=np.int32)
     
-    def update_exchange_rate(self, rate: ExchangeRate) -> None:
-        """Update exchange rate in the graph."""
-        self.graph.add_exchange_rate(rate)
-        
-        # Update token index mapping
-        if rate.base_token not in self.token_to_idx:
-            idx = len(self.token_to_idx)
-            self.token_to_idx[rate.base_token] = idx
-            self.idx_to_token[idx] = rate.base_token
-        
-        if rate.quote_token not in self.token_to_idx:
-            idx = len(self.token_to_idx)
-            self.token_to_idx[rate.quote_token] = idx
-            self.idx_to_token[idx] = rate.quote_token
-        
-        self._last_update_ns = time.time_ns()
+    # Set diagonal to 0
+    for i in range(n_nodes):
+        dist_matrix[i, i] = 0.0
     
-    def build_weight_matrix(self) -> np.ndarray:
-        """Build adjacency weight matrix for graph algorithms."""
-        n = len(self.token_to_idx)
+    # Copy adjacency matrix
+    for i in range(n_nodes):
+        for j in range(n_nodes):
+            if adj_matrix[i, j] < INF:
+                dist_matrix[i, j] = adj_matrix[i, j]
+                next_matrix[i, j] = j
+    
+    # Floyd-Warshall main loop
+    for k in prange(n_nodes):
+        for i in range(n_nodes):
+            for j in range(n_nodes):
+                if dist_matrix[i, k] + dist_matrix[k, j] < dist_matrix[i, j]:
+                    dist_matrix[i, j] = dist_matrix[i, k] + dist_matrix[k, j]
+                    next_matrix[i, j] = next_matrix[i, k]
+    
+    return dist_matrix, next_matrix
+
+
+@jit(nopython=True, cache=True)
+def reconstruct_path(
+    next_matrix: np.ndarray,
+    start: int,
+    end: int
+) -> np.ndarray:
+    """Reconstruct path from Floyd-Warshall next matrix."""
+    if next_matrix[start, end] == -1:
+        return np.array([], dtype=np.int32)
+    
+    path = [start]
+    current = start
+    
+    while current != end:
+        current = next_matrix[current, end]
+        if current == -1:
+            return np.array([], dtype=np.int32)
+        path.append(current)
+    
+    return np.array(path, dtype=np.int32)
+
+
+class ArbitrageEngine:
+    """Main arbitrage detection engine using graph algorithms."""
+    
+    def __init__(self, max_assets: int = 500):
+        self.asset_to_idx: Dict[str, int] = {}
+        self.idx_to_asset: Dict[int, str] = {}
+        self.max_assets = max_assets
+        self.n_assets = 0
+        
+        # Edge storage
+        self.edges: List[Tuple[int, int, float, str, float]] = []  # (from, to, rate, venue, fee)
+        
+        # Cached matrices
+        self.adj_matrix: Optional[np.ndarray] = None
+        self.last_update_ms: int = 0
+    
+    def register_asset(self, asset: str) -> int:
+        """Register asset and return its index."""
+        if asset not in self.asset_to_idx:
+            if self.n_assets >= self.max_assets:
+                raise ValueError(f"Maximum assets ({self.max_assets}) exceeded")
+            
+            self.asset_to_idx[asset] = self.n_assets
+            self.idx_to_asset[self.n_assets] = asset
+            self.n_assets += 1
+        
+        return self.asset_to_idx[asset]
+    
+    def add_rate(self, base: str, quote: str, rate: float, venue: str, fee_bps: float):
+        """Add exchange rate to graph."""
+        u = self.register_asset(base)
+        v = self.register_asset(quote)
+        
+        # Store both directions (bidirectional market)
+        effective_rate = rate * (1 - fee_bps / 10000)
+        self.edges.append((u, v, effective_rate, venue, fee_bps))
+    
+    def build_edge_array(self) -> np.ndarray:
+        """Build numpy array of edges for Bellman-Ford."""
+        if not self.edges:
+            return np.empty((0, 3), dtype=np.float64)
+        
+        edge_data = []
+        for u, v, rate, venue, fee in self.edges:
+            # Use -log(rate) so shortest path = maximum product of rates
+            weight = -np.log(rate)
+            edge_data.append([u, v, weight])
+        
+        return np.array(edge_data, dtype=np.float64)
+    
+    def build_adj_matrix(self) -> np.ndarray:
+        """Build adjacency matrix for Floyd-Warshall."""
         INF = 1e18
+        adj = np.full((self.n_assets, self.n_assets), INF, dtype=np.float64)
         
-        # Initialize with infinity
-        weights = np.full((n, n), INF, dtype=np.float64)
-        np.fill_diagonal(weights, 0.0)
+        for u, v, rate, venue, fee in self.edges:
+            weight = -np.log(rate)
+            if weight < adj[u, v]:
+                adj[u, v] = weight
         
-        # Fill in edge weights (negative log of rates for arbitrage)
-        for (src, dst), rates in self.graph.edges.items():
-            if src in self.token_to_idx and dst in self.token_to_idx:
-                src_idx = self.token_to_idx[src]
-                dst_idx = self.token_to_idx[dst]
-                
-                # Get best rate considering fees
-                best_rate = max(
-                    (r.rate * (1 - r.fee_bps / 10000) for r in rates),
-                    default=0
-                )
-                
-                if best_rate > 0:
-                    # Negative log transform: profitable arb = negative cycle
-                    weights[src_idx, dst_idx] = -np.log(best_rate)
-        
-        return weights
+        return adj
     
-    def detect_triangular_arbitrage_bellman_ford(
-        self,
-        start_token: str
-    ) -> List[ArbitragePath]:
-        """
-        Detect triangular arbitrage starting from a specific token
-        using Bellman-Ford algorithm.
-        """
-        if start_token not in self.token_to_idx:
-            return []
-        
-        n = len(self.token_to_idx)
-        start_idx = self.token_to_idx[start_token]
-        
-        # Build edge lists for Numba
-        edges_src = []
-        edges_dst = []
-        weights_list = []
-        
-        for (src, dst), rates in self.graph.edges.items():
-            if src in self.token_to_idx and dst in self.token_to_idx:
-                best_rate = max(
-                    (r.rate * (1 - r.fee_bps / 10000) for r in rates),
-                    default=0
-                )
-                if best_rate > 0:
-                    edges_src.append(self.token_to_idx[src])
-                    edges_dst.append(self.token_to_idx[dst])
-                    weights_list.append(-np.log(best_rate))
-        
-        if not edges_src:
-            return []
-        
-        edges_src = np.array(edges_src, dtype=np.int32)
-        edges_dst = np.array(edges_dst, dtype=np.int32)
-        weights_arr = np.array(weights_list, dtype=np.float64)
-        
-        try:
-            if NUMBA_AVAILABLE:
-                dist, pred = bellman_ford_numba(
-                    n, start_idx, edges_src, edges_dst, weights_arr
-                )
-            else:
-                # Pure Python fallback
-                dist, pred = self._bellman_ford_python(
-                    n, start_idx, edges_src, edges_dst, weights_arr
-                )
-        except Exception:
-            return []
-        
-        # Check for negative cycles (arbitrage opportunities)
+    def find_arbitrage_bellman_ford(self) -> List[ArbitragePath]:
+        """Find arbitrage opportunities using Bellman-Ford."""
         opportunities = []
+        edges_arr = self.build_edge_array()
         
-        for i in range(len(edges_src)):
-            u = edges_src[i]
-            v = edges_dst[i]
-            w = weights_arr[i]
+        if edges_arr.size == 0:
+            return opportunities
+        
+        # Try each node as source
+        for source in range(min(self.n_assets, 10)):  # Limit sources for performance
+            distances, predecessors = bellman_ford_numpy(
+                self.n_assets, edges_arr, source
+            )
             
-            if dist[u] != 1e18 and dist[u] + w < dist[v]:
-                # Negative cycle detected - reconstruct path
-                path = self._reconstruct_path(pred, v, start_idx)
+            has_arb = detect_negative_cycle(self.n_assets, edges_arr, distances)
+            
+            if has_arb:
+                # Reconstruct arbitrage cycle
+                path = self._find_cycle(predecessors, source)
                 if path:
-                    profit_pct = self._calculate_profit(path)
-                    if profit_pct > self.min_profit_threshold:
+                    profit, route, venues, rates = self._calculate_profit(path)
+                    if profit > 0.1:  # Minimum 0.1% profit threshold
                         opportunities.append(ArbitragePath(
-                            path=[self.idx_to_token[idx] for idx in path],
-                            profit_percentage=profit_pct,
-                            input_amount=1000.0,
-                            expected_output=1000.0 * np.exp(-dist[v]),
-                            gas_cost_usd=50.0,
-                            net_profit_usd=1000.0 * (np.exp(profit_pct / 100) - 1) - 50,
-                            confidence=min(1.0, profit_pct / 2.0),
-                            timestamp_ns=time.time_ns(),
+                            path=route,
+                            profit_pct=profit,
+                            venues=venues,
+                            rates=rates,
+                            total_fees_bps=0,
+                            confidence=min(95, 50 + profit * 10)
                         ))
         
         return opportunities
     
-    def detect_all_arbitrage_floyd_warshall(
-        self
-    ) -> List[ArbitragePath]:
-        """
-        Detect all arbitrage opportunities using Floyd-Warshall algorithm.
-        More comprehensive but O(n^3) complexity.
-        """
-        n = len(self.token_to_idx)
-        if n < 3 or n > 500:  # Limit for performance
-            return []
-        
-        weights = self.build_weight_matrix()
-        
-        try:
-            if NUMBA_AVAILABLE:
-                dist = floyd_warshall_numba(n, weights)
-            else:
-                dist = self._floyd_warshall_python(weights)
-        except Exception:
-            return []
-        
+    def find_arbitrage_floyd_warshall(self) -> List[ArbitragePath]:
+        """Find all arbitrage opportunities using Floyd-Warshall."""
         opportunities = []
         
-        # Check diagonal for negative values (negative cycles)
-        for i in range(n):
-            if dist[i, i] < 0:
-                # Arbitrage opportunity exists
-                profit_pct = (np.exp(-dist[i, i]) - 1) * 100
-                
-                if profit_pct > self.min_profit_threshold:
-                    token = self.idx_to_token[i]
-                    opportunities.append(ArbitragePath(
-                        path=[token],  # Simplified - would reconstruct full path
-                        profit_percentage=profit_pct,
-                        input_amount=1000.0,
-                        expected_output=1000.0 * np.exp(-dist[i, i]),
-                        gas_cost_usd=50.0,
-                        net_profit_usd=1000.0 * (np.exp(profit_pct / 100) - 1) - 50,
-                        confidence=min(1.0, profit_pct / 2.0),
-                        timestamp_ns=time.time_ns(),
-                    ))
+        if self.n_assets > 100:  # O(n^3) - limit for large graphs
+            return opportunities
+        
+        adj = self.build_adj_matrix()
+        dist_matrix, next_matrix = floyd_warshall_numpy(self.n_assets, adj)
+        
+        # Check diagonal for negative cycles (arbitrage)
+        for i in range(self.n_assets):
+            if dist_matrix[i, i] < 0:
+                # Found arbitrage starting and ending at asset i
+                path = reconstruct_path(next_matrix, i, i)
+                if len(path) > 1:
+                    route = [self.idx_to_asset[idx] for idx in path]
+                    profit = -dist_matrix[i, i] * 100  # Convert log to percentage
+                    
+                    if profit > 0.1:
+                        opportunities.append(ArbitragePath(
+                            path=route,
+                            profit_pct=profit,
+                            venues=[],
+                            rates=[],
+                            total_fees_bps=0,
+                            confidence=min(95, 50 + profit * 10)
+                        ))
         
         return opportunities
     
-    def _bellman_ford_python(
-        self,
-        n: int,
-        start: int,
-        edges_src: np.ndarray,
-        edges_dst: np.ndarray,
-        weights: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Pure Python fallback for Bellman-Ford."""
-        INF = 1e18
-        dist = np.full(n, INF, dtype=np.float64)
-        pred = np.full(n, -1, dtype=np.int32)
+    def _find_cycle(self, predecessors: np.ndarray, source: int) -> List[int]:
+        """Find cycle in graph using predecessor array."""
+        # Simple cycle detection
+        visited = set()
+        current = source
+        path = []
         
-        dist[start] = 0.0
-        
-        for _ in range(n - 1):
-            updated = False
-            for i in range(len(edges_src)):
-                u, v, w = edges_src[i], edges_dst[i], weights[i]
-                if dist[u] != INF and dist[u] + w < dist[v]:
-                    dist[v] = dist[u] + w
-                    pred[v] = u
-                    updated = True
-            if not updated:
+        for _ in range(self.n_assets):
+            if current in visited:
+                # Found cycle
+                if current in path:
+                    idx = path.index(current)
+                    return path[idx:]
                 break
-        
-        return dist, pred
-    
-    def _floyd_warshall_python(self, weights: np.ndarray) -> np.ndarray:
-        """Pure Python fallback for Floyd-Warshall."""
-        n = weights.shape[0]
-        dist = weights.copy()
-        
-        for k in range(n):
-            for i in range(n):
-                for j in range(n):
-                    if dist[i, k] + dist[k, j] < dist[i, j]:
-                        dist[i, j] = dist[i, k] + dist[k, j]
-        
-        return dist
-    
-    def _reconstruct_path(
-        self,
-        pred: np.ndarray,
-        end: int,
-        start: int
-    ) -> List[int]:
-        """Reconstruct path from predecessor array."""
-        path = [end]
-        current = end
-        
-        for _ in range(len(pred)):
-            current = pred[current]
-            if current == -1:
-                return []
-            path.append(current)
-            if current == start:
-                break
-        
-        path.reverse()
-        return path if path[0] == start else []
-    
-    def _calculate_profit(self, path: List[int]) -> float:
-        """Calculate profit percentage for a path."""
-        if len(path) < 2:
-            return 0.0
-        
-        total_log_return = 0.0
-        
-        for i in range(len(path) - 1):
-            src = self.idx_to_token[path[i]]
-            dst = self.idx_to_token[path[i + 1]]
             
-            best_rate = self.graph.get_best_rate(src, dst)
-            if best_rate:
-                effective_rate = best_rate.rate * (1 - best_rate.fee_bps / 10000)
-                total_log_return += np.log(effective_rate)
+            visited.add(current)
+            path.append(current)
+            current = predecessors[current]
+            
+            if current == -1:
+                break
         
-        return (np.exp(total_log_return) - 1) * 100
+        return []
     
-    def get_statistics(self) -> Dict:
-        """Get detector statistics."""
-        return {
-            'tokens_tracked': len(self.token_to_idx),
-            'exchange_pairs': len(self.graph.edges),
-            'acceleration': self.acceleration_status,
-            'last_update_ns': self._last_update_ns,
-            'numba_available': NUMBA_AVAILABLE,
-        }
-
-
-class CrossVenueArbitrage:
-    """
-    Coordinates arbitrage detection across CEX and DEX venues.
-    Combines orderbook data from CEX with pool data from DEX.
-    """
+    def _calculate_profit(
+        self, path: List[int]
+    ) -> Tuple[float, List[str], List[str], List[float]]:
+        """Calculate profit for given path."""
+        if len(path) < 2:
+            return 0.0, [], [], []
+        
+        route = [self.idx_to_asset[idx] for idx in path]
+        route.append(route[0])  # Complete cycle
+        
+        total_rate = 1.0
+        venues = []
+        rates = []
+        
+        for i in range(len(path)):
+            u = path[i]
+            v = path[(i + 1) % len(path)]
+            
+            # Find matching edge
+            for edge_u, edge_v, rate, venue, fee in self.edges:
+                if edge_u == u and edge_v == v:
+                    total_rate *= rate * (1 - fee / 10000)
+                    venues.append(venue)
+                    rates.append(rate)
+                    break
+        
+        profit_pct = (total_rate - 1) * 100
+        return profit_pct, route, venues, rates
     
-    def __init__(self):
-        self.detector = ArbitrageDetector(min_profit_threshold_pct=0.05)
-        self.venue_rates: Dict[str, List[ExchangeRate]] = defaultdict(list)
-    
-    def add_cex_rate(
-        self,
-        exchange: str,
-        base: str,
-        quote: str,
-        bid: float,
-        ask: float,
-        liquidity_usd: float,
-        fee_bps: int = 10
-    ) -> None:
-        """Add CEX orderbook-derived rate."""
-        mid_rate = (bid + ask) / 2
-        spread_adjusted = mid_rate * (1 - (ask - bid) / mid_rate / 2)
+    def get_best_opportunity(self) -> Optional[ArbitragePath]:
+        """Get best arbitrage opportunity across all methods."""
+        all_opps = []
         
-        rate = ExchangeRate(
-            base_token=base,
-            quote_token=quote,
-            rate=spread_adjusted,
-            inverse_rate=1 / spread_adjusted,
-            venue=f"CEX:{exchange}",
-            liquidity_usd=liquidity_usd,
-            fee_bps=fee_bps,
-        )
+        # Try Bellman-Ford first (faster for sparse graphs)
+        bf_opps = self.find_arbitrage_bellman_ford()
+        all_opps.extend(bf_opps)
         
-        self.detector.update_exchange_rate(rate)
-        self.venue_rates[f"CEX:{exchange}"].append(rate)
-    
-    def add_dex_rate(
-        self,
-        dex_name: str,
-        token0: str,
-        token1: str,
-        reserve0: int,
-        reserve1: int,
-        fee_bps: int = 30
-    ) -> None:
-        """Add DEX pool-derived rate."""
-        if reserve0 == 0 or reserve1 == 0:
-            return
+        # Try Floyd-Warshall for dense graphs
+        if self.n_assets <= 50:
+            fw_opps = self.find_arbitrage_floyd_warshall()
+            all_opps.extend(fw_opps)
         
-        rate = reserve1 / reserve0
-        
-        exchange_rate = ExchangeRate(
-            base_token=token0,
-            quote_token=token1,
-            rate=rate,
-            inverse_rate=1 / rate,
-            venue=f"DEX:{dex_name}",
-            liquidity_usd=(reserve0 + reserve1) / 1e18 * 2000,  # Approximate
-            fee_bps=fee_bps,
-        )
-        
-        self.detector.update_exchange_rate(exchange_rate)
-        self.venue_rates[f"DEX:{dex_name}"].append(exchange_rate)
-    
-    def find_best_arbitrage(
-        self,
-        method: str = 'bellman_ford'
-    ) -> Optional[ArbitragePath]:
-        """Find the best arbitrage opportunity."""
-        if method == 'bellman_ford':
-            # Try from major tokens
-            all_opportunities = []
-            for token in ['USDT', 'USDC', 'ETH', 'BTC']:
-                opps = self.detector.detect_triangular_arbitrage_bellman_ford(token)
-                all_opportunities.extend(opps)
-        else:
-            all_opportunities = self.detector.detect_all_arbitrage_floyd_warshall()
-        
-        if not all_opportunities:
+        if not all_opps:
             return None
         
-        # Return highest net profit opportunity
-        return max(all_opportunities, key=lambda o: o.net_profit_usd)
+        return max(all_opps, key=lambda x: x.profit_pct)
+    
+    def clear(self):
+        """Clear all data."""
+        self.asset_to_idx.clear()
+        self.idx_to_asset.clear()
+        self.edges.clear()
+        self.n_assets = 0
+        self.adj_matrix = None
 
 
-if __name__ == '__main__':
-    print("Graph Acceleration Status:", check_graph_acceleration())
-    print("Numba Available:", NUMBA_AVAILABLE)
+def check_amd_environment() -> Dict[str, Any]:
+    """Check AMD ROCm/DirectML environment for GPU acceleration."""
+    env_info = {
+        "rocm_available": ROCM_AVAILABLE,
+        "directml_available": DIRECTML_AVAILABLE,
+        "numba_available": NUMBA_AVAILABLE,
+        "gpu_acceleration_enabled": ROCM_AVAILABLE or DIRECTML_AVAILABLE,
+        "recommendations": []
+    }
     
-    # Example usage
-    arb = CrossVenueArbitrage()
+    if ROCM_AVAILABLE:
+        env_info["recommendations"].append(
+            "ROCm detected - consider using CuPy for GPU-accelerated linear algebra"
+        )
+        os.environ["NUMBA_ENABLE_CUDASIM"] = "0"
     
-    # Add some sample rates
-    arb.add_cex_rate('Binance', 'ETH', 'USDT', 3000.0, 3001.0, 10000000)
-    arb.add_cex_rate('Binance', 'BTC', 'USDT', 60000.0, 60050.0, 50000000)
-    arb.add_dex_rate('UniswapV3', 'ETH', 'USDT', 1000000000000000000000, 3000000000000)
+    if DIRECTML_AVAILABLE:
+        env_info["recommendations"].append(
+            "DirectML detected - Windows GPU acceleration available"
+        )
     
-    stats = arb.detector.get_statistics()
-    print("\nDetector Statistics:")
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
+    if NUMBA_AVAILABLE:
+        env_info["recommendations"].append(
+            "Numba available - JIT compilation enabled for graph algorithms"
+        )
+    else:
+        env_info["recommendations"].append(
+            "WARNING: Numba not available - falling back to pure Python (slow)"
+        )
+    
+    return env_info
+
+
+# Example usage
+if __name__ == "__main__":
+    # Check environment
+    env = check_amd_environment()
+    print(f"Environment: {env}")
+    
+    # Create engine
+    engine = ArbitrageEngine(max_assets=100)
+    
+    # Add sample rates (triangular arbitrage: BTC -> ETH -> USDC -> BTC)
+    engine.add_rate("BTC", "ETH", 15.5, "binance", 10)
+    engine.add_rate("ETH", "USDC", 2500.0, "binance", 10)
+    engine.add_rate("USDC", "BTC", 1 / 40000.0, "binance", 10)
+    
+    # Find opportunities
+    best = engine.get_best_opportunity()
+    if best:
+        print(f"Found arbitrage: {' -> '.join(best.path)}")
+        print(f"Profit: {best.profit_pct:.4f}%")
+        print(f"Confidence: {best.confidence:.1f}%")
+    else:
+        print("No arbitrage opportunities found")

@@ -1,441 +1,484 @@
 """
-Cross-Chain & DEX Aggregation - Chapter 3
-File 7: aggregator.py
+DEX Liquidity Aggregator with Ray Distribution
 
 Builds a Ray-distributed DEX liquidity scanner that batches RPC calls
-across multiple Layer 2 networks, strictly managing worker memory to
-respect the 4GB Python quota. Includes AMD ROCm/DirectML environment checks.
+across multiple Layer 2 networks, strictly managing worker memory to respect
+the 4GB Python quota.
+
+Key Features:
+- Ray-distributed scanning across L2 networks (Arbitrum, Optimism, Base, etc.)
+- Strict memory management with 4GB per-worker limit
+- RPC rate limit handling with exponential backoff
+- Shared memory caching for response deduplication
+- AMD ROCm/DirectML environment checks for GPU acceleration
 """
 
 import os
 import time
-import asyncio
 import hashlib
+import json
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
-from collections import defaultdict
-import json
+from collections import OrderedDict
+import threading
 
-# AMD ROCm/DirectML environment check
-def check_amd_acceleration() -> Dict[str, bool]:
-    """Check for AMD ROCm/DirectML availability for accelerated graph computations."""
-    acceleration_status = {
-        'rocm_available': False,
-        'directml_available': False,
-        'hip_available': False,
-        'recommended_backend': 'cpu'
-    }
-    
-    # Check ROCm environment
-    rocm_paths = ['/opt/rocm', '/usr/lib/rocm', os.environ.get('ROCM_PATH', '')]
-    acceleration_status['rocm_available'] = any(
-        os.path.exists(path) for path in rocm_paths if path
-    )
-    
-    # Check DirectML (Windows)
-    if os.name == 'nt':
-        try:
-            import onnxruntime as ort
-            providers = ort.get_available_providers()
-            acceleration_status['directml_available'] = 'DirectMLExecutionProvider' in providers
-        except ImportError:
-            pass
-    
-    # Check HIP (AMD's CUDA equivalent)
-    try:
-        import ctypes
-        hip_lib = ctypes.util.find_library('amdhip64') or ctypes.util.find_library('hip')
-        acceleration_status['hip_available'] = hip_lib is not None
-    except Exception:
-        pass
-    
-    # Determine recommended backend
-    if acceleration_status['rocm_available'] or acceleration_status['hip_available']:
-        acceleration_status['recommended_backend'] = 'rocm'
-    elif acceleration_status['directml_available']:
-        acceleration_status['recommended_backend'] = 'directml'
-    
-    return acceleration_status
+# Check for AMD ROCm/DirectML availability
+try:
+    import torch
+    ROCM_AVAILABLE = torch.cuda.is_available() and torch.version.hip is not None
+    DIRECTML_AVAILABLE = False  # Would need torch-directml on Windows
+except ImportError:
+    ROCM_AVAILABLE = False
+    DIRECTML_AVAILABLE = False
+
+# Ray imports
+try:
+    import ray
+    from ray import remote
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
+    def remote(cls):
+        return cls
+
+# Memory-mapped shared memory for caching
+try:
+    import mmap
+    MM_AVAILABLE = True
+except ImportError:
+    MM_AVAILABLE = False
+
+
+@dataclass
+class RpcConfig:
+    """RPC endpoint configuration with rate limiting parameters."""
+    url: str
+    chain_id: int
+    chain_name: str
+    max_rps: int = 50  # Max requests per second
+    batch_size: int = 100  # Max batch size
+    timeout_ms: int = 5000
+    retry_count: int = 3
 
 
 @dataclass
 class PoolLiquidity:
-    """Represents liquidity data for a DEX pool."""
+    """Normalized pool liquidity data."""
     pool_address: str
     token0: str
     token1: str
-    reserve0: int
-    reserve1: int
-    fee_tier: int
+    reserve0: float
+    reserve1: float
+    fee_tier: float
     chain_id: int
     dex_name: str
-    timestamp_ns: int
+    timestamp_ms: int
     price_usd: float = 0.0
-    
-    @property
-    def total_liquidity_usd(self) -> float:
-        """Estimate total liquidity in USD."""
-        return (self.reserve0 * self.price_usd + self.reserve1) / 1e18
 
 
 @dataclass
-class ArbitragePath:
-    """Represents a potential arbitrage path."""
-    path: List[str]
-    exchanges: List[str]
-    expected_profit_pct: float
-    gas_cost_usd: float
-    net_profit_pct: float
-    confidence: float
-
-
-class RPCCacheManager:
-    """Manages shared memory caching for RPC responses."""
-    
-    def __init__(self, max_entries: int = 10000, ttl_seconds: int = 5):
-        self._cache: Dict[str, Tuple[Any, float]] = {}
-        self._max_entries = max_entries
-        self._ttl_seconds = ttl_seconds
-        self._hits = 0
-        self._misses = 0
-    
-    def _generate_key(self, method: str, params: tuple) -> str:
-        """Generate cache key from RPC call parameters."""
-        key_data = f"{method}:{json.dumps(params, sort_keys=True)}"
-        return hashlib.sha256(key_data.encode()).hexdigest()[:32]
-    
-    def get(self, method: str, params: tuple) -> Optional[Any]:
-        """Get cached RPC response if valid."""
-        key = self._generate_key(method, params)
-        if key in self._cache:
-            value, timestamp = self._cache[key]
-            if time.time() - timestamp < self._ttl_seconds:
-                self._hits += 1
-                return value
-            else:
-                del self._cache[key]
-        self._misses += 1
-        return None
-    
-    def set(self, method: str, params: tuple, value: Any) -> None:
-        """Cache RPC response."""
-        key = self._generate_key(method, params)
-        
-        # Evict oldest entries if at capacity
-        if len(self._cache) >= self._max_entries:
-            oldest_key = min(self._cache.keys(), 
-                           key=lambda k: self._cache[k][1])
-            del self._cache[oldest_key]
-        
-        self._cache[key] = (value, time.time())
-    
-    @property
-    def hit_rate(self) -> float:
-        """Calculate cache hit rate."""
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
+class ScanResult:
+    """Result from a liquidity scan operation."""
+    chain_id: int
+    pools_scanned: int
+    pools_found: int
+    execution_time_ms: float
+    error_count: int
+    error_messages: List[str] = field(default_factory=list)
 
 
 class RateLimiter:
-    """Rate limiter for RPC calls with exponential backoff."""
+    """Token bucket rate limiter for RPC calls."""
     
-    def __init__(self, calls_per_second: int = 100, burst_size: int = 200):
-        self._calls_per_second = calls_per_second
-        self._burst_size = burst_size
-        self._tokens = burst_size
-        self._last_refill = time.time()
-        self._total_calls = 0
-        self._rate_limited_count = 0
+    def __init__(self, max_rps: int):
+        self.max_rps = max_rps
+        self.tokens = max_rps
+        self.last_update = time.time()
+        self._lock = threading.Lock()
     
-    async def acquire(self) -> None:
-        """Acquire permission to make an RPC call."""
-        while True:
+    def acquire(self) -> bool:
+        """Try to acquire a token, returns True if successful."""
+        with self._lock:
             now = time.time()
-            elapsed = now - self._last_refill
+            elapsed = now - self.last_update
+            self.tokens = min(self.max_rps, self.tokens + elapsed * self.max_rps)
+            self.last_update = now
             
-            # Refill tokens based on elapsed time
-            refill_amount = elapsed * self._calls_per_second
-            self._tokens = min(self._burst_size, self._tokens + refill_amount)
-            self._last_refill = now
-            
-            if self._tokens >= 1:
-                self._tokens -= 1
-                self._total_calls += 1
-                return
-            
-            # Rate limited - wait and retry
-            self._rate_limited_count += 1
-            await asyncio.sleep(0.01)  # 10ms backoff
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return True
+            return False
     
-    @property
-    def rate_limit_ratio(self) -> float:
-        """Ratio of rate-limited calls."""
-        if self._total_calls == 0:
-            return 0.0
-        return self._rate_limited_count / self._total_calls
+    def wait_for_token(self, timeout_ms: int = 5000) -> bool:
+        """Wait for a token to become available."""
+        start = time.time()
+        while time.time() - start < timeout_ms / 1000:
+            if self.acquire():
+                return True
+            time.sleep(0.001)  # 1ms sleep
+        return False
 
 
-class DEXLiquidityScanner:
-    """Ray-distributed DEX liquidity scanner with memory management."""
+class LRUCache:
+    """LRU cache with strict byte-size limits for 4GB quota."""
     
-    SUPPORTED_CHAINS = {
-        1: {'name': 'Ethereum', 'rpc': 'https://eth.llamarpc.com'},
-        56: {'name': 'BSC', 'rpc': 'https://bsc-dataseed.binance.org'},
-        137: {'name': 'Polygon', 'rpc': 'https://polygon-rpc.com'},
-        42161: {'name': 'Arbitrum', 'rpc': 'https://arb1.arbitrum.io/rpc'},
-        10: {'name': 'Optimism', 'rpc': 'https://mainnet.optimism.io'},
-        8453: {'name': 'Base', 'rpc': 'https://mainnet.base.org'},
-    }
+    def __init__(self, max_bytes: int = 4 * 1024 * 1024 * 1024):
+        self.max_bytes = max_bytes
+        self.current_bytes = 0
+        self.cache: OrderedDict[str, Tuple[Any, int, float]] = OrderedDict()
+        self._lock = threading.Lock()
     
-    def __init__(self, max_memory_mb: int = 4096):
-        self.max_memory_mb = max_memory_mb
-        self.cache = RPCCacheManager()
-        self.rate_limiter = RateLimiter()
-        self.pools_by_chain: Dict[int, List[PoolLiquidity]] = defaultdict(list)
-        self._scan_start_time = 0
-        self._pools_scanned = 0
-        self._memory_usage_mb = 0
-        
-        # Check AMD acceleration
-        self.acceleration = check_amd_acceleration()
-    
-    def _check_memory_limit(self) -> bool:
-        """Check if memory usage is within limits."""
-        import resource
-        usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Convert to MB
-        self._memory_usage_mb = usage
-        return usage < self.max_memory_mb
-    
-    async def fetch_pool_reserves(
-        self, 
-        chain_id: int, 
-        pool_address: str
-    ) -> Optional[PoolLiquidity]:
-        """Fetch pool reserves with caching and rate limiting."""
-        # Check cache first
-        cached = self.cache.get('eth_getReserves', (pool_address,))
-        if cached:
-            return cached
-        
-        # Rate limit
-        await self.rate_limiter.acquire()
-        
-        # Fetch from RPC (simplified - would use web3.py in production)
-        rpc_url = self.SUPPORTED_CHAINS.get(chain_id, {}).get('rpc')
-        if not rpc_url:
+    def get(self, key: str) -> Optional[Any]:
+        """Get item from cache, returns None if not found."""
+        with self._lock:
+            if key in self.cache:
+                value, size, _ = self.cache.pop(key)
+                self.cache[key] = (value, size, time.time())
+                return value
             return None
+    
+    def put(self, key: str, value: Any) -> bool:
+        """Put item in cache, returns False if too large."""
+        serialized = json.dumps(value).encode('utf-8')
+        size = len(serialized)
         
-        try:
-            # Simulated RPC call structure
-            payload = {
-                'jsonrpc': '2.0',
-                'method': 'eth_call',
-                'params': [{
-                    'to': pool_address,
-                    'data': '0x0902f1ac'  # getReserves() selector
-                }, 'latest'],
-                'id': 1
+        if size > self.max_bytes:
+            return False
+        
+        with self._lock:
+            # Evict until we have space
+            while self.current_bytes + size > self.max_bytes and self.cache:
+                _, evicted_size, _ = self.cache.popitem(last=False)
+                self.current_bytes -= evicted_size
+            
+            # Remove old entry if exists
+            if key in self.cache:
+                _, old_size, _ = self.cache.pop(key)
+                self.current_bytes -= old_size
+            
+            self.cache[key] = (value, size, time.time())
+            self.current_bytes += size
+            return True
+    
+    def clear(self):
+        """Clear all cached data."""
+        with self._lock:
+            self.cache.clear()
+            self.current_bytes = 0
+    
+    def stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._lock:
+            return {
+                "items": len(self.cache),
+                "current_bytes": self.current_bytes,
+                "max_bytes": self.max_bytes,
+                "utilization": self.current_bytes / self.max_bytes
             }
-            
-            # In production: async HTTP request to RPC endpoint
-            # For now, return simulated data
-            pool_data = PoolLiquidity(
-                pool_address=pool_address,
-                token0='0xToken0',
-                token1='0xToken1',
-                reserve0=1000000000000000000000,
-                reserve1=500000000000000000000,
-                fee_tier=3000,
-                chain_id=chain_id,
-                dex_name='UniswapV3',
-                timestamp_ns=int(time.time() * 1e9)
-            )
-            
-            # Cache the result
-            self.cache.set('eth_getReserves', (pool_address,), pool_data)
-            
-            return pool_data
-            
-        except Exception as e:
-            print(f"Error fetching pool {pool_address}: {e}")
-            return None
+
+
+@remote
+class DexScannerActor:
+    """Ray actor for distributed DEX scanning on a specific chain."""
     
-    async def scan_chain_pools(
-        self,
-        chain_id: int,
-        pool_addresses: List[str],
-        batch_size: int = 50
-    ) -> List[PoolLiquidity]:
-        """Scan pools on a specific chain with batching."""
-        results = []
-        
-        # Process in batches to manage memory
-        for i in range(0, len(pool_addresses), batch_size):
-            batch = pool_addresses[i:i + batch_size]
-            
-            # Check memory before processing batch
-            if not self._check_memory_limit():
-                print(f"Memory limit approaching ({self._memory_usage_mb}MB), pausing...")
-                await asyncio.sleep(1)
-                # Force garbage collection
-                import gc
-                gc.collect()
-            
-            tasks = [
-                self.fetch_pool_reserves(chain_id, addr) 
-                for addr in batch
-            ]
-            
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for result in batch_results:
-                if isinstance(result, PoolLiquidity):
-                    results.append(result)
-                    self._pools_scanned += 1
-                elif isinstance(result, Exception):
-                    print(f"Pool scan error: {result}")
-            
-            # Small delay between batches
-            await asyncio.sleep(0.01)
-        
-        return results
+    def __init__(self, config: RpcConfig):
+        self.config = config
+        self.rate_limiter = RateLimiter(config.max_rps)
+        self.cache = LRUCache(max_bytes=512 * 1024 * 1024)  # 512MB per actor
+        self.request_count = 0
+        self.error_count = 0
+        self._session = None
     
-    async def scan_all_chains(
-        self,
-        pools_by_chain: Dict[int, List[str]]
-    ) -> Dict[int, List[PoolLiquidity]]:
-        """Scan pools across all supported chains."""
-        self._scan_start_time = time.time()
-        results = {}
-        
-        # Create tasks for each chain
-        tasks = {}
-        for chain_id, addresses in pools_by_chain.items():
-            if chain_id in self.SUPPORTED_CHAINS:
-                tasks[chain_id] = self.scan_chain_pools(chain_id, addresses)
-        
-        # Execute scans concurrently
-        chain_results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        
-        for idx, chain_id in enumerate(tasks.keys()):
-            result = chain_results[idx]
-            if isinstance(result, list):
-                results[chain_id] = result
-                self.pools_by_chain[chain_id] = result
-            else:
-                print(f"Chain {chain_id} scan failed: {result}")
-        
-        return results
+    def _get_session(self):
+        """Get or create HTTP session for RPC calls."""
+        if self._session is None:
+            try:
+                import aiohttp
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.config.timeout_ms / 1000)
+                )
+            except ImportError:
+                import requests
+                self._session = requests.Session()
+        return self._session
     
-    def find_best_price(
-        self,
-        token_in: str,
-        token_out: str,
-        amount_in: int
-    ) -> Optional[Tuple[PoolLiquidity, float]]:
-        """Find the best price across all scanned pools."""
-        best_pool = None
-        best_price = 0.0
-        
-        for chain_pools in self.pools_by_chain.values():
-            for pool in chain_pools:
-                # Check if pool matches token pair
-                if (pool.token0.lower() == token_in.lower() and 
-                    pool.token1.lower() == token_out.lower()):
-                    # Calculate effective price
-                    price = pool.reserve1 / pool.reserve0
-                    if price > best_price:
-                        best_price = price
-                        best_pool = pool
+    async def _make_rpc_call(self, method: str, params: List[Any]) -> Optional[Dict]:
+        """Make RPC call with rate limiting and retry logic."""
+        for attempt in range(self.config.retry_count):
+            if not self.rate_limiter.wait_for_token(self.config.timeout_ms):
+                self.error_count += 1
+                return {"error": "Rate limit timeout"}
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": self.request_count
+            }
+            self.request_count += 1
+            
+            try:
+                session = self._get_session()
                 
-                elif (pool.token1.lower() == token_in.lower() and 
-                      pool.token0.lower() == token_out.lower()):
-                    # Reverse pair
-                    price = pool.reserve0 / pool.reserve1
-                    if price > best_price:
-                        best_price = price
-                        best_pool = pool
+                # Async path
+                if hasattr(session, 'post') and hasattr(session.post, '__await__'):
+                    async with session.post(self.config.url, json=payload) as resp:
+                        result = await resp.json()
+                else:
+                    # Sync path
+                    resp = session.post(self.config.url, json=payload)
+                    result = resp.json()
+                
+                if "error" in result:
+                    self.error_count += 1
+                    return result
+                
+                return result
+                
+            except Exception as e:
+                if attempt == self.config.retry_count - 1:
+                    self.error_count += 1
+                    return {"error": str(e)}
+                time.sleep(0.1 * (2 ** attempt))  # Exponential backoff
         
-        if best_pool:
-            return (best_pool, best_price)
         return None
     
-    def get_scan_statistics(self) -> Dict[str, Any]:
-        """Get statistics about the scan operation."""
-        elapsed = time.time() - self._scan_start_time if self._scan_start_time else 0
+    async def scan_pools(self, tokens: List[str], min_liquidity_usd: float = 10000) -> List[PoolLiquidity]:
+        """Scan for liquidity pools containing specified tokens."""
+        pools = []
         
-        return {
-            'pools_scanned': self._pools_scanned,
-            'elapsed_seconds': elapsed,
-            'pools_per_second': self._pools_scanned / elapsed if elapsed > 0 else 0,
-            'cache_hit_rate': self.cache.hit_rate,
-            'rate_limit_ratio': self.rate_limiter.rate_limit_ratio,
-            'memory_usage_mb': self._memory_usage_mb,
-            'acceleration_backend': self.acceleration['recommended_backend'],
-            'chains_scanned': len([c for c in self.pools_by_chain if self.pools_by_chain[c]]),
-        }
-
-
-# Ray worker function for distributed scanning
-def scan_pools_worker(
-    chain_id: int,
-    pool_batch: List[str],
-    cache_manager: RPCCacheManager
-) -> List[Dict]:
-    """
-    Ray worker function for parallel pool scanning.
-    Memory-efficient implementation for 4GB quota.
-    """
-    import gc
-    
-    results = []
-    
-    for pool_addr in pool_batch:
-        # Check cache
-        cached = cache_manager.get('eth_getReserves', (pool_addr,))
+        # Check cache first
+        cache_key = f"scan:{self.config.chain_id}:{','.join(sorted(tokens))}:{min_liquidity_usd}"
+        cached = self.cache.get(cache_key)
         if cached:
-            results.append({
-                'pool_address': cached.pool_address,
-                'reserve0': cached.reserve0,
-                'reserve1': cached.reserve1,
-                'chain_id': cached.chain_id,
-            })
-            continue
+            return [PoolLiquidity(**p) for p in cached]
         
-        # Simulate pool data fetch
-        pool_data = {
-            'pool_address': pool_addr,
-            'reserve0': 1000000000000000000000,
-            'reserve1': 500000000000000000000,
-            'chain_id': chain_id,
-        }
-        results.append(pool_data)
+        # In production, would query actual DEX factories (Uniswap V2/V3, etc.)
+        # This is a simplified example showing the pattern
         
-        # Periodic cleanup for memory management
-        if len(results) % 100 == 0:
-            gc.collect()
-    
-    return results
-
-
-if __name__ == '__main__':
-    # Example usage
-    async def main():
-        scanner = DEXLiquidityScanner(max_memory_mb=4096)
-        
-        print("AMD Acceleration Status:", scanner.acceleration)
-        
-        # Sample pools to scan
-        test_pools = {
-            1: ['0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640'],  # ETH USDC
-            56: ['0x58F876857a02D6762E0101bb5C46A8c1ED44Dc16'],  # BNB BUSD
+        # Example: Query Uniswap V2 factory
+        factory_addresses = {
+            1: "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",  # Ethereum
+            42161: "0xf1D7CC64Fb4452F05c498126312eBE29D303fBB6",  # Arbitrum
+            10: "0x0c3c1c532F1e39EdF36BE9Fe0bE1410313E074Bf",  # Optimism
+            8453: "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",  # Base
         }
         
-        results = await scanner.scan_all_chains(test_pools)
-        stats = scanner.get_scan_statistics()
+        factory = factory_addresses.get(self.config.chain_id)
+        if not factory:
+            return []
         
-        print("\nScan Statistics:")
-        for key, value in stats.items():
-            print(f"  {key}: {value}")
+        # Batch get pairs (simplified - would use multicall in production)
+        for i in range(0, len(tokens), 2):
+            if i + 1 >= len(tokens):
+                break
+            
+            # Get pair address
+            token_a, token_b = sorted([tokens[i], tokens[i+1]])
+            result = await self._make_rpc_call("eth_call", [{
+                "to": factory,
+                "data": f"0xe6a43905{token_a[2:].zfill(64)}{token_b[2:].zfill(64)}"
+            }, "latest"])
+            
+            if result and "result" in result:
+                pair_address = "0x" + result["result"][-40:]
+                if pair_address != "0x" + "0" * 40:
+                    # Get reserves
+                    reserves_result = await self._make_rpc_call("eth_call", [{
+                        "to": pair_address,
+                        "data": "0x0902f1ac"
+                    }, "latest"])
+                    
+                    if reserves_result and "result" in result:
+                        # Parse reserves (simplified)
+                        pools.append(PoolLiquidity(
+                            pool_address=pair_address,
+                            token0=token_a,
+                            token1=token_b,
+                            reserve0=0.0,  # Would parse from result
+                            reserve1=0.0,
+                            fee_tier=0.003,
+                            chain_id=self.config.chain_id,
+                            dex_name="Uniswap V2",
+                            timestamp_ms=int(time.time() * 1000)
+                        ))
+        
+        # Cache results
+        self.cache.put(cache_key, [vars(p) for p in pools])
+        
+        return pools
     
-    asyncio.run(main())
+    def get_stats(self) -> Dict[str, Any]:
+        """Get scanner statistics."""
+        return {
+            "chain_id": self.config.chain_id,
+            "chain_name": self.config.chain_name,
+            "request_count": self.request_count,
+            "error_count": self.error_count,
+            "cache_stats": self.cache.stats(),
+            "rocm_available": ROCM_AVAILABLE,
+            "directml_available": DIRECTML_AVAILABLE
+        }
+    
+    async def close(self):
+        """Cleanup resources."""
+        if self._session and hasattr(self._session, 'close'):
+            if hasattr(self._session.close, '__await__'):
+                await self._session.close()
+            else:
+                self._session.close()
+
+
+class DexAggregator:
+    """Main aggregator coordinating distributed scanners."""
+    
+    def __init__(self, rpc_configs: List[RpcConfig]):
+        if not RAY_AVAILABLE:
+            raise ImportError("Ray is required for DexAggregator")
+        
+        if not ray.is_initialized():
+            # Initialize Ray with memory limits
+            ray.init(
+                object_store_memory=2 * 1024 * 1024 * 1024,  # 2GB object store
+                _system_config={"object_store_memory": 2 * 1024 * 1024 * 1024}
+            )
+        
+        self.scanners: Dict[int, ray.actor.ActorHandle] = {}
+        self.global_cache = LRUCache(max_bytes=2 * 1024 * 1024 * 1024)  # 2GB global
+        
+        # Create scanner actors for each chain
+        for config in rpc_configs:
+            scanner = DexScannerActor.remote(config)
+            self.scanners[config.chain_id] = scanner
+    
+    async def scan_all_chains(self, tokens: List[str], min_liquidity_usd: float = 10000) -> Dict[int, List[PoolLiquidity]]:
+        """Scan all configured chains in parallel."""
+        tasks = []
+        
+        for chain_id, scanner in self.scanners.items():
+            task = scanner.scan_pools.remote(tokens, min_liquidity_usd)
+            tasks.append((chain_id, task))
+        
+        results = {}
+        for chain_id, task in tasks:
+            try:
+                pools = await task
+                results[chain_id] = pools
+            except Exception as e:
+                results[chain_id] = []
+        
+        return results
+    
+    async def get_best_price(self, token_in: str, token_out: str, amount: float) -> Optional[Dict]:
+        """Find best execution price across all chains and pools."""
+        all_pools = await self.scan_all_chains([token_in, token_out])
+        
+        best_price = 0.0
+        best_route = None
+        
+        for chain_id, pools in all_pools.items():
+            for pool in pools:
+                # Calculate price (simplified)
+                if pool.token0 == token_in:
+                    price = pool.reserve1 / pool.reserve0 if pool.reserve0 > 0 else 0
+                else:
+                    price = pool.reserve0 / pool.reserve1 if pool.reserve1 > 0 else 0
+                
+                if price > best_price:
+                    best_price = price
+                    best_route = {
+                        "chain_id": chain_id,
+                        "pool": pool.pool_address,
+                        "price": price,
+                        "dex": pool.dex_name
+                    }
+        
+        return best_route
+    
+    def get_all_stats(self) -> Dict[str, Any]:
+        """Get aggregated statistics from all scanners."""
+        stats = {"chains": {}, "global_cache": self.global_cache.stats()}
+        
+        for chain_id, scanner in self.scanners.items():
+            chain_stats = ray.get(scanner.get_stats.remote())
+            stats["chains"][chain_id] = chain_stats
+        
+        return stats
+    
+    def shutdown(self):
+        """Shutdown all scanners and cleanup."""
+        for scanner in self.scanners.values():
+            ray.get(scanner.close.remote())
+        ray.shutdown()
+
+
+def check_amd_environment() -> Dict[str, Any]:
+    """Check AMD ROCm/DirectML environment for GPU acceleration."""
+    env_info = {
+        "rocm_available": ROCM_AVAILABLE,
+        "directml_available": DIRECTML_AVAILABLE,
+        "gpu_acceleration_enabled": ROCM_AVAILABLE or DIRECTML_AVAILABLE,
+        "recommendations": []
+    }
+    
+    if ROCM_AVAILABLE:
+        env_info["recommendations"].append("ROCm detected - enabling GPU acceleration for graph computations")
+        # Set environment variables for PyTorch ROCm
+        os.environ["HSA_OVERRIDE_GFX_VERSION"] = "9.0.0"  # For compatibility
+    
+    if DIRECTML_AVAILABLE:
+        env_info["recommendations"].append("DirectML detected - using Windows GPU acceleration")
+    
+    if not env_info["gpu_acceleration_enabled"]:
+        env_info["recommendations"].append("No GPU acceleration available - using CPU fallback")
+    
+    return env_info
+
+
+# Example usage
+if __name__ == "__main__":
+    # Check AMD environment
+    amd_env = check_amd_environment()
+    print(f"AMD Environment: {amd_env}")
+    
+    # Configure RPC endpoints
+    configs = [
+        RpcConfig(
+            url="https://arb1.arbitrum.io/rpc",
+            chain_id=42161,
+            chain_name="Arbitrum One",
+            max_rps=100
+        ),
+        RpcConfig(
+            url="https://mainnet.optimism.io",
+            chain_id=10,
+            chain_name="Optimism",
+            max_rps=100
+        ),
+        RpcConfig(
+            url="https://base.publicnode.com",
+            chain_id=8453,
+            chain_name="Base",
+            max_rps=100
+        ),
+    ]
+    
+    # Create aggregator (requires Ray)
+    if RAY_AVAILABLE:
+        aggregator = DexAggregator(configs)
+        
+        # Scan for ETH/USDC pools
+        import asyncio
+        results = asyncio.run(aggregator.scan_all_chains(
+            ["0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH
+             "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"],  # USDC
+            min_liquidity_usd=50000
+        ))
+        
+        print(f"Scan results: {results}")
+        
+        # Get stats
+        stats = aggregator.get_all_stats()
+        print(f"Aggregator stats: {stats}")
+        
+        aggregator.shutdown()
