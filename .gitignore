@@ -3,37 +3,41 @@
 *.pyc
 __pycache__/
 
-# Dependencies
-venv/
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Environment files
 .env
 .env.local
 *.env.*
 
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-
 # Editors
 .vscode/
 .idea/
-
-# Build artifacts
-target/
-build/
-dist/
 
 # Coverage reports
 coverage/
 htmlcov/
 .coverage
 
-# MyPy cache
+# Python cache
 .mypy_cache/
 .pytest_cache/
 
-# OS generated files
-.DS_Store
-Thumbs.db
+# Distribution artifacts
+dist/
+build/
 ```
