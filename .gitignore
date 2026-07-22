@@ -3,41 +3,43 @@
 *.pyc
 __pycache__/
 
-# Rust build artifacts
-target/
-Cargo.lock
+# Build artifacts
+build/
+dist/
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.exe
 
-# Virtual environments
-.venv/
+# Dependencies
 venv/
-env/
-
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.swp
-
-# Environment files
+.venv/
 .env
 .env.local
 *.env.*
 
-# Editors
-.vscode/
-.idea/
+# Logs
+*.log
 
 # Coverage reports
+.coverage
 coverage/
 htmlcov/
-.coverage
 
-# Python cache
-.mypy_cache/
-.pytest_cache/
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
 
-# Distribution artifacts
-dist/
-build/
+# System files
+.DS_Store
+Thumbs.db
+
+# Rust/Cargo
+target/
+Cargo.lock
 ```
