@@ -4,11 +4,10 @@
 __pycache__/
 *.o
 *.obj
-*.class
-*.exe
-*.dll
 *.so
-*.a
+*.dll
+*.exe
+*.class
 *.out
 
 # Dependencies
@@ -19,8 +18,6 @@ target/
 .gradle/
 .mypy_cache/
 .pytest_cache/
-dist/
-build/
 
 # Logs and temp files
 *.log
@@ -37,7 +34,7 @@ build/
 .vscode/
 .idea/
 
-# System files
+# OS specific
 .DS_Store
 Thumbs.db
 
