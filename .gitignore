@@ -3,7 +3,7 @@
 *.pyc
 __pycache__/
 
-# Rust build artifacts
+# Rust compilation artifacts
 target/
 **/*.rs.bk
 
@@ -34,8 +34,4 @@ htmlcov/
 # Python cache
 .mypy_cache/
 .pytest_cache/
-
-# Build directories
-dist/
-build/
 ```
