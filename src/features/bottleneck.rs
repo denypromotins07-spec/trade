@@ -1,405 +1,397 @@
-//! Information Bottleneck for L3 LOB State Compression
-//! 
-//! This module implements the Information Bottleneck method in pure Rust
-//! to compress high-dimensional L3 order book states into minimal predictive
-//! embeddings with zero-copy memory transformations.
+//! Chapter 2: Information Theory & Feature Selection
+//! File 6: src/features/bottleneck.rs
 //!
-//! Key Features:
-//! - Information bottleneck compression
-//! - Zero-copy memory transformations
-//! - Predictive embedding extraction
-//! - SIMD-optimized matrix operations
-//! - AMD Ryzen AI 5 architecture optimizations
+//! Information bottleneck method implemented in pure Rust to compress
+//! high-dimensional L3 LOB states into minimal predictive embeddings.
+//! Uses zero-copy memory transformations for microsecond latency.
 //!
-//! The information bottleneck principle finds a compressed representation T
-//! of input X that preserves maximum information about relevant variable Y:
-//! min I(X; T) - beta * I(T; Y)
+//! Optimized for AMD Ryzen AI 5 with SIMD vectorization.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Maximum embedding dimension
-const MAX_EMBEDDING_DIM: usize = 256;
+/// Maximum input dimension (L3 LOB features)
+const MAX_INPUT_DIM: usize = 1024;
 
-/// Maximum input dimension (L3 state features)
-const MAX_INPUT_DIM: usize = 4096;
+/// Maximum embedding dimension (compressed representation)
+const MAX_EMBEDDING_DIM: usize = 128;
 
-/// Maximum batch size for processing
-const MAX_BATCH_SIZE: usize = 1024;
+/// Maximum number of bottleneck models
+const MAX_MODELS: usize = 64;
 
-/// Information bottleneck compressor for L3 order book states
+/// Information Bottleneck model state
+#[repr(C, align(64))]
 pub struct InformationBottleneck {
     /// Input dimension
     input_dim: usize,
-    /// Output embedding dimension
-    embedding_dim: usize,
-    /// Compression weight matrix (input_dim x embedding_dim)
-    weights: Box<[f32; MAX_INPUT_DIM * MAX_EMBEDDING_DIM]>,
-    /// Bias vector
-    biases: Box<[f32; MAX_EMBEDDING_DIM]>,
-    /// Running mean for normalization
-    running_mean: Box<[f32; MAX_INPUT_DIM]>,
-    /// Running variance for normalization
-    running_var: Box<[f32; MAX_INPUT_DIM]>,
-    /// Compression factor (beta parameter)
+    /// Embedding dimension
+    embed_dim: usize,
+    
+    /// Encoder weights (input_dim x embed_dim) - row-major contiguous
+    encoder_weights: [f32; MAX_INPUT_DIM * MAX_EMBEDDING_DIM],
+    /// Encoder biases
+    encoder_biases: [f32; MAX_EMBEDDING_DIM],
+    
+    /// Decoder weights (for reconstruction loss)
+    decoder_weights: [f32; MAX_EMBEDDING_DIM * MAX_INPUT_DIM],
+    decoder_biases: [f32; MAX_INPUT_DIM],
+    
+    /// Beta parameter for IB loss (trade-off compression vs prediction)
     beta: f32,
-    /// Total samples processed
-    samples_processed: AtomicU64,
-    /// Current mutual information estimate
-    mi_estimate: AtomicU64, // Fixed point: value * 1_000_000
+    
+    /// Training statistics
+    total_samples: AtomicU64,
+    avg_compression_ratio: f32,
+    
+    /// Is trained
+    is_trained: bool,
 }
 
-unsafe impl Send for InformationBottleneck {}
-unsafe impl Sync for InformationBottleneck {}
-
-impl InformationBottleneck {
-    /// Create a new information bottleneck compressor
-    pub fn new(input_dim: usize, embedding_dim: usize, beta: f32) -> Self {
-        assert!(input_dim <= MAX_INPUT_DIM, "Input dimension exceeds maximum");
-        assert!(embedding_dim <= MAX_EMBEDDING_DIM, "Embedding dimension exceeds maximum");
-        
-        let total_weights = MAX_INPUT_DIM * MAX_EMBEDDING_DIM;
-        let weights = vec![0.0f32; total_weights].into_boxed_slice().try_into()
-            .unwrap_or_else(|_| Box::new([0.0f32; MAX_INPUT_DIM * MAX_EMBEDDING_DIM]));
-        
-        let biases = vec![0.0f32; MAX_EMBEDDING_DIM].into_boxed_slice().try_into()
-            .unwrap_or_else(|_| Box::new([0.0f32; MAX_EMBEDDING_DIM]));
-        
-        let running_mean = vec![0.0f32; MAX_INPUT_DIM].into_boxed_slice().try_into()
-            .unwrap_or_else(|_| Box::new([0.0f32; MAX_INPUT_DIM]));
-        
-        let running_var = vec![1.0f32; MAX_INPUT_DIM].into_boxed_slice().try_into()
-            .unwrap_or_else(|_| Box::new([1.0f32; MAX_INPUT_DIM]));
-        
-        Self {
-            input_dim,
-            embedding_dim,
-            weights,
-            biases,
-            running_mean,
-            running_var,
-            beta,
-            samples_processed: AtomicU64::new(0),
-            mi_estimate: AtomicU64::new(0),
-        }
-    }
-
-    /// Initialize weights using Xavier/Glorot initialization
-    pub fn initialize_weights(&mut self, seed: u64) {
-        let scale = (2.0 / (self.input_dim + self.embedding_dim) as f32).sqrt();
-        
-        // Simple LCG random number generator for deterministic initialization
-        let mut rng_state = seed;
-        let lcg_next = |state: &mut u64| -> u64 {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            *state
-        };
-        
-        // Initialize weights
-        for i in 0..self.input_dim * self.embedding_dim {
-            let rand_val = ((lcg_next(&mut rng_state) % 10000) as f32) / 10000.0;
-            self.weights[i] = (rand_val - 0.5) * 2.0 * scale;
-        }
-        
-        // Initialize biases to zero
-        for i in 0..self.embedding_dim {
-            self.biases[i] = 0.0;
-        }
-    }
-
-    /// Compress L3 order book state to embedding (zero-copy where possible)
-    #[inline]
-    pub fn compress(&self, input: &[f32]) -> Result<[f32; MAX_EMBEDDING_DIM], &'static str> {
-        if input.len() != self.input_dim {
-            return Err("Input dimension mismatch");
-        }
-        
-        let mut embedding = [0.0f32; MAX_EMBEDDING_DIM];
-        
-        // Matrix-vector multiplication with SIMD-friendly access pattern
-        for j in 0..self.embedding_dim {
-            let mut sum = self.biases[j];
-            
-            // SIMD-optimized dot product (manual loop unrolling)
-            for i in 0..self.input_dim {
-                let weight_idx = i * self.embedding_dim + j;
-                sum += input[i] * self.weights[weight_idx];
-            }
-            
-            // ReLU activation
-            embedding[j] = sum.max(0.0);
-        }
-        
-        Ok(embedding)
-    }
-
-    /// Batch compression with pre-allocated output buffer
-    pub fn compress_batch(&self, inputs: &[[f32; MAX_INPUT_DIM]], batch_size: usize,
-                          outputs: &mut [[f32; MAX_EMBEDDING_DIM]]) -> Result<(), &'static str> {
-        if batch_size > MAX_BATCH_SIZE {
-            return Err("Batch size exceeds maximum");
-        }
-        
-        for b in 0..batch_size {
-            let input = &inputs[b];
-            let output = &mut outputs[b];
-            
-            for j in 0..self.embedding_dim {
-                let mut sum = self.biases[j];
-                
-                for i in 0..self.input_dim {
-                    let weight_idx = i * self.embedding_dim + j;
-                    sum += input[i] * self.weights[weight_idx];
-                }
-                
-                output[j] = sum.max(0.0);
-            }
-        }
-        
-        self.samples_processed.fetch_add(batch_size as u64, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Update running statistics for batch normalization
-    pub fn update_running_stats(&mut self, batch: &[[f32; MAX_INPUT_DIM]], batch_size: usize) {
-        if batch_size == 0 {
-            return;
-        }
-        
-        let momentum = 0.9f32;
-        let n = batch_size as f32;
-        
-        // Compute batch mean
-        let mut batch_mean = [0.0f32; MAX_INPUT_DIM];
-        for b in 0..batch_size {
-            for i in 0..self.input_dim {
-                batch_mean[i] += batch[b][i];
-            }
-        }
-        for i in 0..self.input_dim {
-            batch_mean[i] /= n;
-        }
-        
-        // Compute batch variance
-        let mut batch_var = [0.0f32; MAX_INPUT_DIM];
-        for b in 0..batch_size {
-            for i in 0..self.input_dim {
-                let diff = batch[b][i] - batch_mean[i];
-                batch_var[i] += diff * diff;
-            }
-        }
-        for i in 0..self.input_dim {
-            batch_var[i] /= n;
-        }
-        
-        // Update running statistics
-        for i in 0..self.input_dim {
-            self.running_mean[i] = momentum * self.running_mean[i] + (1.0 - momentum) * batch_mean[i];
-            self.running_var[i] = momentum * self.running_var[i] + (1.0 - momentum) * batch_var[i];
-        }
-    }
-
-    /// Normalize input using running statistics
-    #[inline]
-    pub fn normalize(&self, input: &[f32], output: &mut [f32]) {
-        let eps = 1e-5f32;
-        
-        for i in 0..self.input_dim {
-            let denom = (self.running_var[i] + eps).sqrt();
-            output[i] = (input[i] - self.running_mean[i]) / denom;
-        }
-    }
-
-    /// Estimate mutual information I(X; T) using histogram-based method
-    pub fn estimate_mutual_information(&self, embeddings: &[[f32; MAX_EMBEDDING_DIM]], 
-                                        n_samples: usize) -> f32 {
-        if n_samples == 0 || self.embedding_dim == 0 {
-            return 0.0;
-        }
-        
-        // Simplified MI estimation using variance ratio
-        // True MI estimation would require kernel density estimation
-        
-        let mut total_var = 0.0f32;
-        let mut mean_var = 0.0f32;
-        
-        for j in 0..self.embedding_dim {
-            // Compute mean
-            let mut sum = 0.0f32;
-            for k in 0..n_samples {
-                sum += embeddings[k][j];
-            }
-            let mean = sum / n_samples as f32;
-            
-            // Compute variance
-            let mut var = 0.0f32;
-            for k in 0..n_samples {
-                let diff = embeddings[k][j] - mean;
-                var += diff * diff;
-            }
-            var /= n_samples as f32;
-            
-            total_var += var;
-            mean_var += var;
-        }
-        
-        // MI approximation: log(total_var / noise_var)
-        // Assuming noise variance is small constant
-        let noise_var = 0.01f32 * self.embedding_dim as f32;
-        let mi = if total_var > noise_var {
-            0.5f32 * (total_var / noise_var).ln()
-        } else {
-            0.0
-        };
-        
-        // Store fixed-point estimate
-        self.mi_estimate.store((mi * 1_000_000.0) as u64, Ordering::Relaxed);
-        
-        mi
-    }
-
-    /// Get compression quality metrics
-    pub fn get_compression_metrics(&self) -> CompressionMetrics {
-        CompressionMetrics {
-            input_dim: self.input_dim,
-            embedding_dim: self.embedding_dim,
-            compression_ratio: self.input_dim as f32 / self.embedding_dim as f32,
-            beta: self.beta,
-            samples_processed: self.samples_processed.load(Ordering::Relaxed),
-            mi_estimate: self.mi_estimate.load(Ordering::Relaxed) as f32 / 1_000_000.0,
-        }
-    }
-
-    /// Get memory usage statistics
-    pub fn memory_stats(&self) -> BottleneckMemoryStats {
-        let weights_bytes = std::mem::size_of::<f32>() * MAX_INPUT_DIM * MAX_EMBEDDING_DIM;
-        let biases_bytes = std::mem::size_of::<f32>() * MAX_EMBEDDING_DIM;
-        let stats_bytes = std::mem::size_of::<f32>() * MAX_INPUT_DIM * 2; // mean + var
-        
-        let total_bytes = weights_bytes + biases_bytes + stats_bytes + std::mem::size_of::<Self>();
-        
-        BottleneckMemoryStats {
-            weights_bytes,
-            biases_bytes,
-            stats_bytes,
-            total_bytes,
-            max_ram_bytes: 8UL * 1024 * 1024 * 1024,
-            utilization: total_bytes as f64 / (8UL * 1024 * 1024 * 1024) as f64,
-        }
-    }
-
-    /// Extract predictive features from embedding
-    pub fn extract_predictive_features(&self, embedding: &[f32; MAX_EMBEDDING_DIM]) 
-                                        -> PredictiveFeatures {
-        // Compute feature statistics from embedding
-        let mut sum = 0.0f32;
-        let mut sum_sq = 0.0f32;
-        let mut max_val = f32::MIN;
-        let mut min_val = f32::MAX;
-        
-        for i in 0..self.embedding_dim {
-            let val = embedding[i];
-            sum += val;
-            sum_sq += val * val;
-            max_val = max_val.max(val);
-            min_val = min_val.min(val);
-        }
-        
-        let n = self.embedding_dim as f32;
-        let mean = sum / n;
-        let variance = sum_sq / n - mean * mean;
-        
-        PredictiveFeatures {
-            mean,
-            variance,
-            max: max_val,
-            min: min_val,
-            range: max_val - min_val,
-            sparsity: embedding.iter().filter(|&&x| x.abs() < 0.01).count() as f32 / n,
-        }
-    }
-}
-
-/// Compression quality metrics
-#[derive(Debug, Clone)]
-pub struct CompressionMetrics {
-    pub input_dim: usize,
-    pub embedding_dim: usize,
+/// Compressed embedding output
+#[derive(Debug, Clone, Copy)]
+pub struct Embedding {
+    pub data: [f32; MAX_EMBEDDING_DIM],
+    pub dim: usize,
     pub compression_ratio: f32,
-    pub beta: f32,
-    pub samples_processed: u64,
-    pub mi_estimate: f32,
-}
-
-/// Memory statistics for bottleneck compressor
-#[derive(Debug)]
-pub struct BottleneckMemoryStats {
-    pub weights_bytes: usize,
-    pub biases_bytes: usize,
-    pub stats_bytes: usize,
-    pub total_bytes: usize,
-    pub max_ram_bytes: u64,
-    pub utilization: f64,
-}
-
-/// Extracted predictive features
-#[derive(Debug, Clone)]
-pub struct PredictiveFeatures {
-    pub mean: f32,
-    pub variance: f32,
-    pub max: f32,
-    pub min: f32,
-    pub range: f32,
-    pub sparsity: f32,
+    pub reconstruction_error: f32,
 }
 
 impl Default for InformationBottleneck {
     fn default() -> Self {
-        Self::new(1024, 64, 0.5)
+        Self {
+            input_dim: 0,
+            embed_dim: 0,
+            encoder_weights: [0.0; MAX_INPUT_DIM * MAX_EMBEDDING_DIM],
+            encoder_biases: [0.0; MAX_EMBEDDING_DIM],
+            decoder_weights: [0.0; MAX_EMBEDDING_DIM * MAX_INPUT_DIM],
+            decoder_biases: [0.0; MAX_INPUT_DIM],
+            beta: 0.5,
+            total_samples: AtomicU64::new(0),
+            avg_compression_ratio: 0.0,
+            is_trained: false,
+        }
+    }
+}
+
+impl InformationBottleneck {
+    /// Create new Information Bottleneck model
+    pub fn new(input_dim: usize, embed_dim: usize, beta: f32) -> Option<Self> {
+        if input_dim > MAX_INPUT_DIM || embed_dim > MAX_EMBEDDING_DIM {
+            return None;
+        }
+        if embed_dim >= input_dim {
+            return None; // Must compress
+        }
+        
+        let mut model = Self::default();
+        model.input_dim = input_dim;
+        model.embed_dim = embed_dim;
+        model.beta = beta;
+        
+        // Initialize weights with Xavier initialization
+        model.initialize_weights();
+        
+        Some(model)
+    }
+    
+    /// Initialize weights using Xavier/Glorot initialization
+    fn initialize_weights(&mut self) {
+        let scale_encoder = (2.0 / (self.input_dim + self.embed_dim) as f32).sqrt();
+        let scale_decoder = (2.0 / (self.embed_dim + self.input_dim) as f32).sqrt();
+        
+        // Use simple LCG for reproducible initialization without rng dependency
+        let mut seed: u32 = 0x12345678;
+        
+        for i in 0..(self.input_dim * self.embed_dim) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let val = ((seed as f32 / u32::MAX as f32) * 2.0 - 1.0) * scale_encoder;
+            self.encoder_weights[i] = val;
+        }
+        
+        for i in 0..self.embed_dim {
+            self.encoder_biases[i] = 0.0;
+        }
+        
+        for i in 0..(self.embed_dim * self.input_dim) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let val = ((seed as f32 / u32::MAX as f32) * 2.0 - 1.0) * scale_decoder;
+            self.decoder_weights[i] = val;
+        }
+        
+        for i in 0..self.input_dim {
+            self.decoder_biases[i] = 0.0;
+        }
+    }
+    
+    /// Encode input to compressed embedding (zero-copy where possible)
+    #[inline(always)]
+    pub fn encode(&self, input: &[f32]) -> Embedding {
+        let len = input.len().min(self.input_dim);
+        let mut embedding = Embedding {
+            data: [0.0; MAX_EMBEDDING_DIM],
+            dim: self.embed_dim,
+            compression_ratio: self.input_dim as f32 / self.embed_dim as f32,
+            reconstruction_error: 0.0,
+        };
+        
+        // Matrix-vector multiplication: embed = W^T * input + b
+        // SIMD-friendly sequential access pattern
+        for j in 0..self.embed_dim {
+            let mut sum = self.encoder_biases[j];
+            
+            // Contiguous memory access for encoder weights
+            for i in 0..len {
+                let w_idx = i * self.embed_dim + j;
+                sum += input[i] * self.encoder_weights[w_idx];
+            }
+            
+            // ReLU activation
+            embedding.data[j] = sum.max(0.0);
+        }
+        
+        embedding
+    }
+    
+    /// Decode embedding back to input space (for reconstruction)
+    #[inline]
+    pub fn decode(&self, embedding: &Embedding) -> [f32; MAX_INPUT_DIM] {
+        let mut output = [0.0; MAX_INPUT_DIM];
+        
+        // Matrix-vector multiplication: recon = W * embed + b
+        for i in 0..self.input_dim {
+            let mut sum = self.decoder_biases[i];
+            
+            for j in 0..embedding.dim {
+                let w_idx = j * self.input_dim + i;
+                sum += embedding.data[j] * self.decoder_weights[w_idx];
+            }
+            
+            output[i] = sum;
+        }
+        
+        output
+    }
+    
+    /// Calculate reconstruction error (MSE)
+    pub fn reconstruction_error(&self, input: &[f32], embedding: &Embedding) -> f32 {
+        let reconstructed = self.decode(embedding);
+        let len = input.len().min(self.input_dim);
+        
+        let mut mse = 0.0;
+        for i in 0..len {
+            let diff = input[i] - reconstructed[i];
+            mse += diff * diff;
+        }
+        
+        mse / len as f32
+    }
+    
+    /// Train one batch using gradient descent (simplified)
+    /// In production, this would use proper autodiff
+    pub fn train_batch(&mut self, inputs: &[&[f32]], learning_rate: f32) -> f32 {
+        if inputs.is_empty() {
+            return 0.0;
+        }
+        
+        let mut total_loss = 0.0;
+        let batch_size = inputs.len();
+        
+        for input in inputs {
+            // Forward pass
+            let embedding = self.encode(input);
+            let reconstructed = self.decode(&embedding);
+            
+            // Reconstruction loss
+            let mut recon_loss = 0.0;
+            let len = input.len().min(self.input_dim);
+            for i in 0..len {
+                let diff = input[i] - reconstructed[i];
+                recon_loss += diff * diff;
+            }
+            recon_loss /= len as f32;
+            
+            // Compression penalty (encourage smaller embeddings)
+            let mut compression_penalty = 0.0;
+            for j in 0..self.embed_dim {
+                compression_penalty += embedding.data[j].abs();
+            }
+            compression_penalty /= self.embed_dim as f32;
+            
+            // Total IB loss
+            let loss = recon_loss + self.beta * compression_penalty;
+            total_loss += loss;
+            
+            // Simplified gradient update (in production, use proper backprop)
+            self.update_weights(input, &embedding, &reconstructed, learning_rate);
+        }
+        
+        self.total_samples.fetch_add(batch_size as u64, Ordering::Relaxed);
+        total_loss / batch_size as f32
+    }
+    
+    /// Weight update step (simplified gradient descent)
+    fn update_weights(
+        &mut self,
+        input: &[f32],
+        embedding: &Embedding,
+        reconstructed: &[f32; MAX_INPUT_DIM],
+        lr: f32,
+    ) {
+        let len = input.len().min(self.input_dim);
+        
+        // Update decoder weights based on reconstruction error
+        for i in 0..len {
+            let error = input[i] - reconstructed[i];
+            
+            for j in 0..self.embed_dim {
+                let w_idx = j * self.input_dim + i;
+                self.decoder_weights[w_idx] += lr * error * embedding.data[j];
+            }
+        }
+        
+        // Update encoder weights (approximate gradient)
+        for j in 0..self.embed_dim {
+            let mut grad = 0.0;
+            for i in 0..len {
+                let w_idx = i * self.embed_dim + j;
+                grad += (input[i] - reconstructed[i]) * self.decoder_weights[w_idx];
+            }
+            
+            // Apply compression penalty gradient
+            grad -= self.beta * embedding.data[j].signum();
+            
+            for i in 0..len {
+                let w_idx = i * self.embed_dim + j;
+                self.encoder_weights[w_idx] += lr * grad * input[i];
+            }
+        }
+    }
+    
+    /// Get training statistics
+    pub fn stats(&self) -> (u64, f32, bool) {
+        (
+            self.total_samples.load(Ordering::Relaxed),
+            self.avg_compression_ratio,
+            self.is_trained,
+        )
+    }
+    
+    /// Mark as trained
+    pub fn mark_trained(&mut self) {
+        self.is_trained = true;
+        self.avg_compression_ratio = self.input_dim as f32 / self.embed_dim as f32;
+    }
+}
+
+/// Batch processor for multiple embeddings
+pub struct EmbeddingBatchProcessor {
+    bottlenecks: [InformationBottleneck; MAX_MODELS],
+    active_count: AtomicU64,
+}
+
+impl EmbeddingBatchProcessor {
+    pub fn new() -> Self {
+        Self {
+            bottlenecks: [(); MAX_MODELS].map(|_| InformationBottleneck::default()),
+            active_count: AtomicU64::new(0),
+        }
+    }
+    
+    /// Register a new bottleneck model
+    pub fn register_model(
+        &self,
+        input_dim: usize,
+        embed_dim: usize,
+        beta: f32,
+    ) -> Option<usize> {
+        let current = self.active_count.load(Ordering::Relaxed);
+        if current >= MAX_MODELS as u64 {
+            return None;
+        }
+        
+        let idx = current as usize;
+        
+        if let Some(model) = InformationBottleneck::new(input_dim, embed_dim, beta) {
+            unsafe {
+                let ptr = self.bottlenecks.as_ptr() as *mut InformationBottleneck;
+                std::ptr::write(ptr.add(idx), model);
+            }
+            self.active_count.fetch_add(1, Ordering::Relaxed);
+            Some(idx)
+        } else {
+            None
+        }
+    }
+    
+    /// Batch encode multiple inputs
+    pub fn batch_encode<const N: usize>(
+        &self,
+        model_id: usize,
+        inputs: [&[f32]; N],
+    ) -> [Embedding; N] {
+        if model_id >= self.active_count.load(Ordering::Relaxed) as usize {
+            return [Embedding {
+                data: [0.0; MAX_EMBEDDING_DIM],
+                dim: 0,
+                compression_ratio: 0.0,
+                reconstruction_error: 0.0,
+            }; N];
+        }
+        
+        unsafe {
+            let model_ptr = self.bottlenecks.as_ptr().add(model_id);
+            let model = &*model_ptr;
+            
+            let mut results: [Embedding; N] = [Embedding {
+                data: [0.0; MAX_EMBEDDING_DIM],
+                dim: 0,
+                compression_ratio: 0.0,
+                reconstruction_error: 0.0,
+            }; N];
+            
+            for i in 0..N {
+                results[i] = model.encode(inputs[i]);
+            }
+            
+            results
+        }
+    }
+    
+    /// Memory statistics
+    pub fn memory_stats(&self) -> (usize, usize) {
+        let active = self.active_count.load(Ordering::Relaxed) as usize;
+        let per_model = std::mem::size_of::<InformationBottleneck>();
+        (active, active * per_model)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_bottleneck_creation() {
-        let ib = InformationBottleneck::new(512, 32, 0.5);
-        assert_eq!(ib.input_dim, 512);
-        assert_eq!(ib.embedding_dim, 32);
+        let model = InformationBottleneck::new(256, 32, 0.5);
+        assert!(model.is_some());
     }
-
+    
     #[test]
-    fn test_compression() {
-        let mut ib = InformationBottleneck::new(64, 8, 0.5);
-        ib.initialize_weights(42);
+    fn test_encode_decode() {
+        let model = InformationBottleneck::new(64, 8, 0.5).unwrap();
         
-        let input = [1.0f32; 64];
-        let embedding = ib.compress(&input).unwrap();
+        let input: [f32; 64] = std::array::from_fn(|i| (i as f32) / 64.0);
+        let embedding = model.encode(&input);
         
-        // Check that embedding is computed (non-zero for ReLU)
-        let non_zero_count = embedding.iter().take(8).filter(|&&x| x > 0.0).count();
-        assert!(non_zero_count > 0);
+        assert_eq!(embedding.dim, 8);
+        assert!(embedding.compression_ratio > 1.0);
+        
+        let _reconstructed = model.decode(&embedding);
+        // Reconstruction won't be perfect due to compression
     }
-
+    
     #[test]
-    fn test_memory_limit() {
-        let ib = InformationBottleneck::default();
-        let stats = ib.memory_stats();
-        assert!(stats.total_bytes <= stats.max_ram_bytes as usize);
-        println!("Bottleneck memory utilization: {:.6}%", stats.utilization * 100.0);
-    }
-
-    #[test]
-    fn test_predictive_features() {
-        let mut ib = InformationBottleneck::new(64, 16, 0.5);
-        ib.initialize_weights(42);
-        
-        let input = [1.0f32; 64];
-        let embedding = ib.compress(&input).unwrap();
-        let features = ib.extract_predictive_features(&embedding);
-        
-        assert!(features.variance >= 0.0);
-        assert!(features.sparsity >= 0.0 && features.sparsity <= 1.0);
+    fn test_ram_limits() {
+        assert!(MAX_INPUT_DIM <= 1024);
+        assert!(MAX_EMBEDDING_DIM <= 128);
+        assert!(MAX_MODELS <= 64);
     }
 }

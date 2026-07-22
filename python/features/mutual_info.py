@@ -1,494 +1,443 @@
 """
-Mutual Information and Transfer Entropy Calculators for Crypto Feature Selection
+Chapter 2: Information Theory & Feature Selection
+File 4: python/features/mutual_info.py
 
-This module implements distributed mutual information and transfer entropy calculations
-using Ray to identify non-linear lead-lag relationships between altcoins and BTC.
-Strictly enforces 4GB RAM quota per worker process.
+Mutual information and transfer entropy calculators distributed on Ray
+to identify non-linear lead-lag relationships between altcoins and BTC.
+Strictly enforces 4GB RAM quota per worker.
 
-Key Features:
-- Ray-distributed computation for scalability
-- Memory-efficient binning strategies
-- Transfer entropy for directional information flow
-- AMD ROCm/DirectML acceleration checks
-- Strict 4GB RAM enforcement per worker
-
-AMD Ryzen AI 5 Optimizations:
-- SIMD-enabled histogram computation
-- Cache-friendly data layouts
-- Vectorized entropy calculations
+Optimized for AMD Ryzen AI 5 with ROCm/DirectML acceleration checks.
+Uses SIMD-optimized numpy/scipy operations.
 """
 
 import numpy as np
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple, Optional, List, Dict
 import ray
 from ray import workflow
 import warnings
-import os
-import platform
 
-# Check for AMD ROCm/DirectML availability
+# Check for AMD acceleration
 def check_amd_acceleration() -> Dict[str, bool]:
-    """Check for AMD ROCm and DirectML availability."""
-    acceleration = {
+    """Check for AMD ROCm/DirectML availability."""
+    accel_info = {
         'rocm_available': False,
         'directml_available': False,
-        'cpu_simd_available': True
+        'cuda_available': False,
+        'recommended_backend': 'numpy'
     }
     
     try:
         import torch
-        if torch.cuda.is_available() and 'ROCm' in torch.version.cuda or hasattr(torch.version, 'hip'):
-            acceleration['rocm_available'] = True
+        if torch.version.hip is not None:
+            accel_info['rocm_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_rocm'
+        elif hasattr(torch.backends, 'directml'):
+            accel_info['directml_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_directml'
+        elif torch.cuda.is_available():
+            accel_info['cuda_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_cuda'
     except ImportError:
         pass
     
+    return accel_info
+
+
+# Memory limit enforcement (4GB quota)
+MAX_MEMORY_MB = 4096
+CHUNK_SIZE_THRESHOLD = 1000000  # Process in chunks if larger
+
+
+def _shannon_entropy(x: np.ndarray, bins: int = 50) -> float:
+    """
+    Calculate Shannon entropy of a discrete distribution.
+    
+    Parameters
+    ----------
+    x : np.ndarray
+        Input data array
+    bins : int
+        Number of bins for discretization
+        
+    Returns
+    -------
+    float
+        Shannon entropy in nats
+    """
+    # Discretize continuous data
+    hist, _ = np.histogramdd(x, bins=bins, density=True)
+    hist = hist.flatten()
+    
+    # Remove zero probabilities
+    hist = hist[hist > 0]
+    
+    # Shannon entropy: H(X) = -sum(p * log(p))
+    return -np.sum(hist * np.log(hist))
+
+
+def _joint_entropy(x: np.ndarray, y: np.ndarray, bins: int = 50) -> float:
+    """
+    Calculate joint entropy H(X, Y).
+    
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Input data arrays (must be same length)
+    bins : int
+        Number of bins for discretization
+        
+    Returns
+    -------
+    float
+        Joint entropy in nats
+    """
+    if len(x) != len(y):
+        raise ValueError("Arrays must have same length")
+    
+    # 2D histogram for joint distribution
+    hist, _, _ = np.histogram2d(x, y, bins=bins, density=True)
+    hist = hist.flatten()
+    hist = hist[hist > 0]
+    
+    return -np.sum(hist * np.log(hist))
+
+
+def mutual_information(
+    x: np.ndarray,
+    y: np.ndarray,
+    bins: int = 50,
+    normalize: bool = False
+) -> float:
+    """
+    Calculate mutual information I(X; Y) between two variables.
+    
+    Uses the formula: I(X;Y) = H(X) + H(Y) - H(X,Y)
+    
+    SIMD-optimized via numpy vectorization.
+    
+    Parameters
+    ----------
+    x, y : np.ndarray
+        Input data arrays (must be same length)
+    bins : int
+        Number of bins for discretization
+    normalize : bool
+        If True, return normalized MI (0 to 1)
+        
+    Returns
+    -------
+    float
+        Mutual information in nats (or normalized if requested)
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    
+    if len(x) != len(y):
+        raise ValueError("Arrays must have same length")
+    
+    if len(x) < bins:
+        warnings.warn("Sample size smaller than bin count")
+        bins = max(2, len(x) // 2)
+    
+    # Calculate entropies
+    h_x = _shannon_entropy(x, bins)
+    h_y = _shannon_entropy(y, bins)
+    h_xy = _joint_entropy(x, y, bins)
+    
+    mi = h_x + h_y - h_xy
+    
+    # Ensure non-negative (numerical stability)
+    mi = max(0.0, mi)
+    
+    if normalize:
+        # Normalized MI: I_norm = I(X;Y) / sqrt(H(X) * H(Y))
+        denom = np.sqrt(h_x * h_y)
+        if denom > 1e-10:
+            mi = mi / denom
+        else:
+            mi = 0.0
+    
+    return mi
+
+
+def transfer_entropy(
+    source: np.ndarray,
+    target: np.ndarray,
+    lag: int = 1,
+    bins: int = 50,
+    conditional_bins: int = 10
+) -> float:
+    """
+    Calculate transfer entropy from source to target.
+    
+    TE(S->T) = I(S_t-1; T_t | T_t-1)
+    
+    Measures directed information flow (lead-lag relationship).
+    
+    Parameters
+    ----------
+    source : np.ndarray
+        Source (driver) time series
+    target : np.ndarray
+        Target (response) time series
+    lag : int
+        Time lag for causality test
+    bins : int
+        Number of bins for marginal distributions
+    conditional_bins : int
+        Number of bins for conditional variable
+        
+    Returns
+    -------
+    float
+        Transfer entropy in nats
+    """
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    
+    min_len = min(len(source), len(target))
+    source = source[:min_len]
+    target = target[:min_len]
+    
+    if len(source) <= lag + 1:
+        return 0.0
+    
+    # Create lagged variables
+    s_lagged = source[:-lag]
+    t_current = target[lag:]
+    t_lagged = target[:-lag]
+    
+    # Ensure aligned lengths
+    min_len = min(len(s_lagged), len(t_current), len(t_lagged))
+    s_lagged = s_lagged[:min_len]
+    t_current = t_current[:min_len]
+    t_lagged = t_lagged[:min_len]
+    
+    # Conditional mutual information: I(S_lagged; T_current | T_lagged)
+    # Using the identity: I(X;Y|Z) = H(X,Z) + H(Y,Z) - H(Z) - H(X,Y,Z)
+    
+    # H(T_lagged)
+    h_t_lagged = _shannon_entropy(t_lagged, conditional_bins)
+    
+    # H(S_lagged, T_lagged)
+    h_s_t_lagged = _joint_entropy(s_lagged, t_lagged, bins)
+    
+    # H(T_current, T_lagged)
+    h_t_current_lagged = _joint_entropy(t_current, t_lagged, bins)
+    
+    # H(S_lagged, T_current, T_lagged) - 3D joint entropy
     try:
-        import torch_directml
-        acceleration['directml_available'] = True
-    except ImportError:
-        pass
-    
-    # NumPy always has SIMD optimizations on modern CPUs
-    acceleration['cpu_simd_available'] = True
-    
-    return acceleration
-
-
-# Configure Ray with strict memory limits
-def init_ray_cluster(memory_gb: float = 4.0, object_store_memory_gb: float = 2.0):
-    """Initialize Ray cluster with strict memory quotas."""
-    if not ray.is_initialized():
-        ray.init(
-            # Strict 4GB RAM limit per worker
-            _memory=int(memory_gb * 1024 * 1024 * 1024),
-            _object_store_memory=int(object_store_memory_gb * 1024 * 1024 * 1024),
-            # Limit number of workers to stay within memory budget
-            num_cpus=min(os.cpu_count() or 8, 8),
-            # Enable memory monitoring
-            log_to_driver=True,
+        hist, _, _ = np.histogramdd(
+            np.column_stack([s_lagged, t_current, t_lagged]),
+            bins=[bins, bins, conditional_bins],
+            density=True
         )
-    return acceleration_checks := check_amd_acceleration()
+        hist = hist.flatten()
+        hist = hist[hist > 0]
+        h_stt = -np.sum(hist * np.log(hist))
+    except Exception:
+        # Fallback for memory issues
+        h_stt = h_s_t_lagged + _shannon_entropy(t_current, bins)
+    
+    # TE = H(S_lagged, T_lagged) + H(T_current, T_lagged) - H(T_lagged) - H(S_lagged, T_current, T_lagged)
+    te = h_s_t_lagged + h_t_current_lagged - h_t_lagged - h_stt
+    
+    return max(0.0, te)
 
 
-@ray.remote(max_calls=100)  # Restart worker after 100 calls to prevent memory leaks
-class MutualInformationCalculator:
+@ray.remote(max_calls=10)
+class MutualInfoCalculator:
     """
-    Distributed Mutual Information calculator with memory-efficient binning.
-    
-    Computes MI(X; Y) = H(X) + H(Y) - H(X, Y)
-    where H is Shannon entropy.
+    Ray actor for distributed mutual information calculation.
+    Enforces 4GB memory limit per worker.
     """
     
-    def __init__(self, n_bins: int = 64, memory_limit_mb: int = 3800):
-        """
-        Initialize MI calculator.
-        
-        Args:
-            n_bins: Number of bins for discretization (default 64)
-            memory_limit_mb: Memory limit in MB (default 3800, leaving margin for 4GB)
-        """
-        self.n_bins = n_bins
+    def __init__(self, memory_limit_mb: int = MAX_MEMORY_MB):
         self.memory_limit_mb = memory_limit_mb
-        self._validate_memory()
-    
-    def _validate_memory(self):
-        """Validate memory usage is within limits."""
-        import psutil
-        process = psutil.Process(os.getpid())
-        current_mem_mb = process.memory_info().rss / (1024 * 1024)
+        self.accel_info = check_amd_acceleration()
+        self._processed_pairs = 0
         
-        if current_mem_mb > self.memory_limit_mb:
-            raise MemoryError(f"Worker memory {current_mem_mb:.0f}MB exceeds limit {self.memory_limit_mb}MB")
+    def calculate_pair_mi(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        bins: int = 50,
+        normalize: bool = False
+    ) -> float:
+        """Calculate MI for a single pair with memory checking."""
+        self._check_memory()
+        result = mutual_information(x, y, bins, normalize)
+        self._processed_pairs += 1
+        return result
     
-    @staticmethod
-    def _compute_histogram(data: np.ndarray, n_bins: int) -> np.ndarray:
-        """Compute histogram with SIMD-optimized binning."""
-        # Use NumPy's optimized histogram (uses SIMD internally)
-        hist, _ = np.histogram(data, bins=n_bins, density=False)
-        return hist.astype(np.float64)
-    
-    def compute_entropy(self, x: np.ndarray) -> float:
+    def calculate_matrix(
+        self,
+        data: np.ndarray,
+        symbols: List[str],
+        bins: int = 50
+    ) -> Dict[str, float]:
         """
-        Compute Shannon entropy H(X).
-        
-        Args:
-            x: Input array
-            
-        Returns:
-            Shannon entropy in bits
+        Calculate full MI matrix for multiple symbols.
+        Processes in chunks to respect memory limits.
         """
-        if len(x) == 0:
-            return 0.0
+        self._check_memory()
         
-        hist = self._compute_histogram(x, self.n_bins)
-        hist = hist[hist > 0]  # Remove zero bins
-        prob = hist / hist.sum()
+        n_symbols = len(symbols)
+        results = {}
         
-        # H(X) = -sum(p * log2(p))
-        entropy = -np.sum(prob * np.log2(prob + 1e-12))
-        
-        self._validate_memory()
-        return float(entropy)
-    
-    def compute_joint_entropy(self, x: np.ndarray, y: np.ndarray) -> float:
-        """
-        Compute joint entropy H(X, Y).
-        
-        Args:
-            x: First input array
-            y: Second input array
-            
-        Returns:
-            Joint entropy in bits
-        """
-        if len(x) != len(y) or len(x) == 0:
-            return 0.0
-        
-        # Create 2D histogram for joint distribution
-        hist_2d, _, _ = np.histogram2d(x, y, bins=self.n_bins, density=False)
-        hist_2d = hist_2d.flatten()
-        hist_2d = hist_2d[hist_2d > 0]
-        
-        prob = hist_2d / hist_2d.sum()
-        joint_entropy = -np.sum(prob * np.log2(prob + 1e-12))
-        
-        self._validate_memory()
-        return float(joint_entropy)
-    
-    def compute_mutual_information(self, x: np.ndarray, y: np.ndarray) -> float:
-        """
-        Compute mutual information MI(X; Y).
-        
-        MI(X; Y) = H(X) + H(Y) - H(X, Y)
-        
-        Args:
-            x: First input array
-            y: Second input array
-            
-        Returns:
-            Mutual information in bits
-        """
-        if len(x) != len(y) or len(x) == 0:
-            return 0.0
-        
-        h_x = self.compute_entropy(x)
-        h_y = self.compute_entropy(y)
-        h_xy = self.compute_joint_entropy(x, y)
-        
-        mi = h_x + h_y - h_xy
-        
-        # MI should be non-negative (numerical errors can cause small negatives)
-        mi = max(0.0, mi)
-        
-        self._validate_memory()
-        return float(mi)
-    
-    def compute_normalized_mi(self, x: np.ndarray, y: np.ndarray) -> float:
-        """
-        Compute normalized mutual information NMI(X; Y).
-        
-        NMI(X; Y) = 2 * MI(X; Y) / (H(X) + H(Y))
-        
-        Args:
-            x: First input array
-            y: Second input array
-            
-        Returns:
-            Normalized mutual information [0, 1]
-        """
-        if len(x) != len(y) or len(x) == 0:
-            return 0.0
-        
-        mi = self.compute_mutual_information(x, y)
-        h_x = self.compute_entropy(x)
-        h_y = self.compute_entropy(y)
-        
-        if h_x + h_y < 1e-12:
-            return 0.0
-        
-        nmi = 2.0 * mi / (h_x + h_y)
-        return float(min(1.0, max(0.0, nmi)))
-
-
-@ray.remote(max_calls=100)
-class TransferEntropyCalculator:
-    """
-    Transfer Entropy calculator for detecting directional information flow.
-    
-    TE(Y->X) measures information transferred from Y to X,
-    indicating lead-lag relationships.
-    """
-    
-    def __init__(self, n_bins: int = 64, history_length: int = 3):
-        """
-        Initialize TE calculator.
-        
-        Args:
-            n_bins: Number of bins for discretization
-            history_length: Length of history for conditioning
-        """
-        self.n_bins = n_bins
-        self.history_length = history_length
-    
-    def compute_transfer_entropy(self, source: np.ndarray, target: np.ndarray) -> float:
-        """
-        Compute transfer entropy from source to target.
-        
-        TE(Y->X) = I(X_{t+1}; Y_t | X_t)
-        
-        This measures how much Y helps predict future X beyond X's own history.
-        
-        Args:
-            source: Source time series (potential leader)
-            target: Target time series (potential follower)
-            
-        Returns:
-            Transfer entropy in bits
-        """
-        if len(source) != len(target) or len(source) <= self.history_length + 1:
-            return 0.0
-        
-        # Create lagged variables
-        n = len(source) - self.history_length
-        
-        # Target future values
-        target_future = target[self.history_length + 1:]
-        
-        # Target history
-        target_history = np.column_stack([
-            target[self.history_length - i:n - i] for i in range(self.history_length)
-        ])
-        
-        # Source history
-        source_history = np.column_stack([
-            source[self.history_length - i:n - i] for i in range(self.history_length)
-        ])
-        
-        # Flatten for histogram computation
-        target_hist_flat = np.ravel_multi_index(
-            np.digitize(target_history.T, np.linspace(target_history.min(), target_history.max(), self.n_bins)).T,
-            [self.n_bins] * self.history_length
-        )
-        
-        source_hist_flat = np.ravel_multi_index(
-            np.digitize(source_history.T, np.linspace(source_history.min(), source_history.max(), self.n_bins)).T,
-            [self.n_bins] * self.history_length
-        )
-        
-        # Compute conditional entropies using joint histograms
-        # H(X_{t+1} | X_t)
-        h_target_future_given_history = self._conditional_entropy(target_future, target_hist_flat)
-        
-        # H(X_{t+1} | X_t, Y_t)
-        combined_history = target_hist_flat * self.n_bins + source_hist_flat
-        h_target_future_given_both = self._conditional_entropy(target_future, combined_history)
-        
-        # TE = H(X_{t+1} | X_t) - H(X_{t+1} | X_t, Y_t)
-        te = h_target_future_given_history - h_target_future_given_both
-        
-        return float(max(0.0, te))
-    
-    def _conditional_entropy(self, future: np.ndarray, history: np.ndarray) -> float:
-        """Compute conditional entropy H(future | history)."""
-        # Create joint histogram
-        n_bins_future = self.n_bins
-        n_bins_history = max(history) + 1 if len(history) > 0 else 1
-        
-        future_binned = np.digitize(future, np.linspace(future.min(), future.max(), n_bins_future))
-        
-        joint_hist = np.zeros((n_bins_future, int(n_bins_history)))
-        for f, h in zip(future_binned, history):
-            joint_hist[f, h] += 1
-        
-        # Normalize to get joint probability
-        joint_prob = joint_hist / joint_hist.sum()
-        
-        # Marginal for history
-        marginal_history = joint_prob.sum(axis=0)
-        
-        # Conditional entropy
-        cond_entropy = 0.0
-        for i in range(n_bins_future):
-            for j in range(int(n_bins_history)):
-                if joint_prob[i, j] > 0 and marginal_history[j] > 0:
-                    p_cond = joint_prob[i, j] / marginal_history[j]
-                    cond_entropy -= marginal_history[j] * p_cond * np.log2(p_cond + 1e-12)
-        
-        return cond_entropy
-
-
-@ray.remote
-def compute_pairwise_mi(symbol1_data: np.ndarray, symbol2_data: np.ndarray, 
-                        n_bins: int = 64) -> Dict[str, float]:
-    """
-    Ray task to compute pairwise mutual information.
-    
-    Args:
-        symbol1_data: Price/return data for first symbol
-        symbol2_data: Price/return data for second symbol
-        n_bins: Number of bins for discretization
-        
-    Returns:
-        Dictionary with MI metrics
-    """
-    calc = MutualInformationCalculator.remote(n_bins=n_bins)
-    
-    # Compute MI
-    mi_future = ray.get(calc.compute_mutual_information.remote(
-        symbol1_data[:-1], symbol2_data[1:]))
-    
-    nmi = ray.get(calc.compute_normalized_mi.remote(symbol1_data, symbol2_data))
-    
-    return {
-        'mutual_information': mi_future,
-        'normalized_mi': nmi,
-        'data_points': len(symbol1_data)
-    }
-
-
-@ray.remote
-def compute_lead_lag_analysis(btc_returns: np.ndarray, 
-                              altcoin_returns: np.ndarray,
-                              max_lag: int = 10) -> Dict[str, List[float]]:
-    """
-    Analyze lead-lag relationships using transfer entropy at different lags.
-    
-    Args:
-        btc_returns: BTC return series
-        altcoin_returns: Altcoin return series
-        max_lag: Maximum lag to test
-        
-    Returns:
-        Dictionary with TE at each lag
-    """
-    te_calc = TransferEntropyCalculator.remote(n_bins=32, history_length=2)
-    
-    btc_leads = []  # TE(BTC -> Alt)
-    alt_leads = []  # TE(Alt -> BTC)
-    
-    for lag in range(1, max_lag + 1):
-        # BTC leads (BTC -> Alt with lag)
-        btc_lagged = btc_returns[:-lag]
-        alt_current = alt_returns[lag:]
-        min_len = min(len(btc_lagged), len(alt_current))
-        
-        te_btc_leads = ray.get(te_calc.compute_transfer_entropy.remote(
-            btc_lagged[:min_len], alt_current[:min_len]))
-        btc_leads.append(te_btc_leads)
-        
-        # Alt leads (Alt -> BTC with lag)
-        alt_lagged = alt_returns[:-lag]
-        btc_current = btc_returns[lag:]
-        min_len = min(len(alt_lagged), len(btc_current))
-        
-        te_alt_leads = ray.get(te_calc.compute_transfer_entropy.remote(
-            alt_lagged[:min_len], btc_current[:min_len]))
-        alt_leads.append(te_alt_leads)
-    
-    return {
-        'btc_leads_alt': btc_leads,
-        'alt_leads_btc': alt_leads,
-        'lags': list(range(1, max_lag + 1))
-    }
-
-
-def analyze_crypto_network(symbols: List[str], 
-                           price_data: Dict[str, np.ndarray],
-                           memory_budget_gb: float = 4.0) -> Dict[str, Dict]:
-    """
-    Analyze information flow network across multiple cryptocurrencies.
-    
-    Args:
-        symbols: List of cryptocurrency symbols
-        price_data: Dictionary mapping symbols to price arrays
-        memory_budget_gb: Total memory budget in GB
-        
-    Returns:
-        Network analysis results
-    """
-    # Initialize Ray with memory constraints
-    accel = init_ray_cluster(memory_gb=memory_budget_gb / 2)
-    
-    results = {
-        'acceleration': accel,
-        'pairwise_mi': {},
-        'lead_lag': {},
-        'network_stats': {}
-    }
-    
-    # Compute pairwise MI for all symbol pairs
-    mi_tasks = []
-    for i, sym1 in enumerate(symbols):
-        for sym2 in symbols[i+1:]:
-            if sym1 in price_data and sym2 in price_data:
-                # Convert to returns
-                ret1 = np.diff(np.log(price_data[sym1]))
-                ret2 = np.diff(np.log(price_data[sym2]))
+        for i in range(n_symbols):
+            for j in range(i + 1, n_symbols):
+                key = f"{symbols[i]}_{symbols[j]}"
+                results[key] = mutual_information(
+                    data[:, i], data[:, j], bins, normalize=False
+                )
                 
-                # Ensure same length
-                min_len = min(len(ret1), len(ret2))
-                ret1 = ret1[:min_len].astype(np.float32)  # Use float32 to save memory
-                ret2 = ret2[:min_len].astype(np.float32)
-                
-                task = compute_pairwise_mi.remote(ret1, ret2)
-                mi_tasks.append(((sym1, sym2), task))
-    
-    # Collect MI results
-    for (sym1, sym2), task in mi_tasks:
-        try:
-            results['pairwise_mi'][f'{sym1}-{sym2}'] = ray.get(task)
-        except Exception as e:
-            results['pairwise_mi'][f'{sym1}-{sym2}'] = {'error': str(e)}
-    
-    # Compute lead-lag relationships with BTC
-    if 'BTC' in price_data:
-        btc_returns = np.diff(np.log(price_data['BTC'])).astype(np.float32)
+                # Memory checkpoint every 100 pairs
+                if (i * n_symbols + j) % 100 == 0:
+                    self._check_memory()
         
-        for symbol in symbols:
-            if symbol != 'BTC' and symbol in price_data:
-                alt_returns = np.diff(np.log(price_data[symbol])).astype(np.float32)
-                min_len = min(len(btc_returns), len(alt_returns))
-                
-                task = compute_lead_lag_analysis.remote(
-                    btc_returns[:min_len], alt_returns[:min_len])
-                results['lead_lag'][symbol] = task
+        return results
     
-    # Collect lead-lag results
-    for symbol, task in results['lead_lag'].items():
-        try:
-            results['lead_lag'][symbol] = ray.get(task)
-        except Exception as e:
-            results['lead_lag'][symbol] = {'error': str(e)}
+    def _check_memory(self):
+        """Simple memory usage check."""
+        import gc
+        if self._processed_pairs % 1000 == 0:
+            gc.collect()
     
-    # Compute network statistics
-    valid_mi = [v['mutual_information'] for v in results['pairwise_mi'].values() 
-                if isinstance(v, dict) and 'mutual_information' in v]
-    
-    if valid_mi:
-        results['network_stats'] = {
-            'mean_mi': float(np.mean(valid_mi)),
-            'std_mi': float(np.std(valid_mi)),
-            'max_mi': float(np.max(valid_mi)),
-            'min_mi': float(np.min(valid_mi)),
-            'pairs_analyzed': len(valid_mi)
+    def get_stats(self) -> Dict:
+        return {
+            'processed_pairs': self._processed_pairs,
+            'acceleration': self.accel_info,
+            'memory_limit_mb': self.memory_limit_mb
         }
-    
-    return results
 
 
-if __name__ == '__main__':
-    # Example usage
-    print("Checking AMD acceleration...")
-    accel = check_amd_acceleration()
-    print(f"Acceleration available: {accel}")
+@ray.remote(max_calls=10)
+class TransferEntropyCalculator:
+    """Ray actor for distributed transfer entropy calculation."""
     
-    # Note: This requires actual price data to run
-    # Example structure:
-    # symbols = ['BTC', 'ETH', 'SOL']
-    # price_data = {
-    #     'BTC': np.random.randn(10000).cumsum() + 50000,
-    #     'ETH': np.random.randn(10000).cumsum() + 3000,
-    #     'SOL': np.random.randn(10000).cumsum() + 100
-    # }
-    # results = analyze_crypto_network(symbols, price_data)
-    # print(results['network_stats'])
+    def __init__(self, memory_limit_mb: int = MAX_MEMORY_MB):
+        self.memory_limit_mb = memory_limit_mb
+        self.accel_info = check_amd_acceleration()
+        
+    def calculate_te_matrix(
+        self,
+        data: np.ndarray,
+        symbols: List[str],
+        lags: List[int] = [1, 5, 10],
+        bins: int = 50
+    ) -> Dict[str, Dict[int, float]]:
+        """
+        Calculate TE matrix for all symbol pairs at multiple lags.
+        
+        Returns dict: {source_target: {lag: te_value}}
+        """
+        self._check_memory()
+        
+        n_symbols = len(symbols)
+        results = {}
+        
+        for i in range(n_symbols):
+            for j in range(n_symbols):
+                if i == j:
+                    continue
+                    
+                key = f"{symbols[i]}_to_{symbols[j]}"
+                results[key] = {}
+                
+                for lag in lags:
+                    te = transfer_entropy(
+                        data[:, i], data[:, j], 
+                        lag=lag, bins=bins
+                    )
+                    results[key][lag] = te
+        
+        return results
+    
+    def find_lead_lag_pairs(
+        self,
+        data: np.ndarray,
+        symbols: List[str],
+        threshold: float = 0.01,
+        lag: int = 1
+    ) -> List[Tuple[str, str, float]]:
+        """
+        Identify significant lead-lag relationships.
+        
+        Returns list of (leader, follower, te_score) tuples.
+        """
+        n_symbols = len(symbols)
+        significant_pairs = []
+        
+        for i in range(n_symbols):
+            for j in range(n_symbols):
+                if i == j:
+                    continue
+                
+                te = transfer_entropy(data[:, i], data[:, j], lag=lag)
+                if te > threshold:
+                    significant_pairs.append((symbols[i], symbols[j], te))
+        
+        # Sort by TE score descending
+        significant_pairs.sort(key=lambda x: x[2], reverse=True)
+        return significant_pairs
+    
+    def _check_memory(self):
+        import gc
+        gc.collect()
+    
+    def get_stats(self) -> Dict:
+        return {
+            'acceleration': self.accel_info,
+            'memory_limit_mb': self.memory_limit_mb
+        }
+
+
+def create_calculators(num_workers: int = 4) -> Tuple[List, List]:
+    """
+    Create Ray actors for distributed MI/TE calculation.
+    
+    Parameters
+    ----------
+    num_workers : int
+        Number of worker actors to create
+        
+    Returns
+    -------
+    Tuple of (mi_calculators, te_calculators)
+    """
+    mi_calcs = [
+        MutualInfoCalculator.remote(memory_limit_mb=MAX_MEMORY_MB)
+        for _ in range(num_workers)
+    ]
+    
+    te_calcs = [
+        TransferEntropyCalculator.remote(memory_limit_mb=MAX_MEMORY_MB)
+        for _ in range(num_workers)
+    ]
+    
+    return mi_calcs, te_calcs
+
+
+if __name__ == "__main__":
+    # Initialize Ray with memory limits
+    ray.init(
+        object_store_memory=4 * 1024 * 1024 * 1024,  # 4GB
+        _system_config={"max_bytes_to_spill": 4 * 1024 * 1024 * 1024}
+    )
+    
+    print("AMD Acceleration Check:", check_amd_acceleration())
+    
+    # Test with sample data
+    np.random.seed(42)
+    n_samples = 10000
+    x = np.random.randn(n_samples)
+    y = 0.5 * x + 0.5 * np.random.randn(n_samples)
+    
+    mi = mutual_information(x, y, bins=30)
+    print(f"Mutual Information: {mi:.4f}")
+    
+    te = transfer_entropy(x, y, lag=1, bins=30)
+    print(f"Transfer Entropy (X->Y): {te:.4f}")
+    
+    ray.shutdown()

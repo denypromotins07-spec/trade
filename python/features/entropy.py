@@ -1,623 +1,629 @@
 """
-Shannon and Approximate Entropy Metrics for Market Regime Detection
+Chapter 2: Information Theory & Feature Selection
+File 5: python/features/entropy.py
 
-This module implements entropy-based metrics using Numba JIT compilation
-to measure market regime complexity and noise levels. Dynamically filters
-out low-signal environments for the RL agent.
+Shannon and Approximate Entropy metrics computed via Numba JIT
+to measure market regime complexity and noise levels.
+Dynamically filters out low-signal environments for the RL agent.
 
-Key Features:
-- Shannon Entropy for distribution complexity
-- Approximate Entropy (ApEn) for time series regularity
-- Sample Entropy (SampEn) for robustness
-- Permutation Entropy for ordinal patterns
-- AMD ROCm/DirectML acceleration checks
-- Strict 4GB RAM quota enforcement
-
-AMD Ryzen AI 5 Optimizations:
-- Numba JIT compilation for SIMD vectorization
-- Parallel entropy computation
-- Cache-efficient sliding windows
+Optimized for AMD Ryzen AI 5 with ROCm/DirectML checks.
+Uses Numba SIMD auto-vectorization for throughput.
 """
 
 import numpy as np
 from numba import jit, prange, float64, int64
-from typing import Tuple, List, Dict, Optional
-import os
-import warnings
+from typing import Tuple, Optional, List, Dict
+import ray
+
+# Memory limit (4GB quota)
+MAX_MEMORY_MB = 4096
 
 
 def check_amd_acceleration() -> Dict[str, bool]:
     """Check for AMD ROCm/DirectML availability."""
-    acceleration = {
+    accel_info = {
         'rocm_available': False,
         'directml_available': False,
-        'numba_simd_available': True,
-        'llvm_optimized': True
+        'cuda_available': False,
+        'numba_available': False,
+        'recommended_backend': 'numpy'
     }
     
     try:
         import torch
-        if hasattr(torch.version, 'hip') or (torch.cuda.is_available() and 'ROCm' in str(torch.version.cuda)):
-            acceleration['rocm_available'] = True
+        if torch.version.hip is not None:
+            accel_info['rocm_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_rocm'
+        elif hasattr(torch.backends, 'directml'):
+            accel_info['directml_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_directml'
+        elif torch.cuda.is_available():
+            accel_info['cuda_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_cuda'
     except ImportError:
         pass
     
+    # Check Numba availability
     try:
-        import torch_directml
-        acceleration['directml_available'] = True
+        from numba import cuda
+        accel_info['numba_available'] = True
     except ImportError:
         pass
     
-    # Numba provides SIMD optimizations on AMD CPUs
-    try:
-        from numba import __version__ as numba_version
-        acceleration['numba_simd_available'] = True
-    except ImportError:
-        acceleration['numba_simd_available'] = False
-    
-    return acceleration
+    return accel_info
 
 
-@jit(nopython=True, cache=True, parallel=False)
+@jit(nopython=True, cache=True, fastmath=True)
 def _shannon_entropy_numba(probabilities: np.ndarray) -> float64:
     """
-    Compute Shannon entropy using Numba JIT.
+    Calculate Shannon entropy using Numba JIT.
     
-    H(X) = -sum(p * log2(p))
+    H(X) = -sum(p * log(p))
     
-    Args:
-        probabilities: Array of probabilities (must sum to 1)
+    Parameters
+    ----------
+    probabilities : np.ndarray
+        Probability distribution (must sum to 1)
         
-    Returns:
-        Shannon entropy in bits
+    Returns
+    -------
+    float64
+        Shannon entropy in nats
     """
     entropy = 0.0
     n = len(probabilities)
     for i in range(n):
         p = probabilities[i]
-        if p > 1e-12:
-            entropy -= p * np.log2(p)
+        if p > 1e-10:
+            entropy -= p * np.log(p)
     return entropy
 
 
-@jit(nopython=True, cache=True, parallel=False)
-def _compute_histogram_numba(data: np.ndarray, n_bins: int64, 
-                              data_min: float64, data_max: float64) -> np.ndarray:
+@jit(nopython=True, cache=True, fastmath=True)
+def _discretize_series(data: np.ndarray, bins: int64) -> np.ndarray:
     """
-    Compute histogram with Numba JIT optimization.
+    Discretize continuous time series into bins.
+    SIMD-optimized via Numba parallelization.
     
-    Args:
-        data: Input data array
-        n_bins: Number of bins
-        data_min: Minimum value for binning
-        data_max: Maximum value for binning
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    bins : int64
+        Number of bins
         
-    Returns:
-        Histogram counts as float64 array
+    Returns
+    -------
+    np.ndarray
+        Discretized series (integer labels)
     """
-    hist = np.zeros(n_bins, dtype=np.float64)
     n = len(data)
-    bin_width = (data_max - data_min) / n_bins
+    result = np.empty(n, dtype=np.int64)
+    
+    min_val = np.min(data)
+    max_val = np.max(data)
+    range_val = max_val - min_val
+    
+    if range_val < 1e-10:
+        return np.zeros(n, dtype=np.int64)
+    
+    bin_width = range_val / bins
     
     for i in range(n):
-        val = data[i]
-        # Clamp value to range
-        if val < data_min:
-            val = data_min
-        elif val >= data_max:
-            val = data_max - 1e-12
-        
-        bin_idx = int((val - data_min) / bin_width)
-        if bin_idx >= n_bins:
-            bin_idx = n_bins - 1
-        hist[bin_idx] += 1.0
+        bin_idx = int64((data[i] - min_val) / bin_width)
+        bin_idx = min(bin_idx, bins - 1)
+        result[i] = bin_idx
     
-    return hist
+    return result
 
 
-@jit(nopython=True, cache=True, parallel=True)
-def _shannon_entropy_parallel(data: np.ndarray, n_bins: int64) -> float64:
+@jit(nopython=True, cache=True, fastmath=True)
+def _count_patterns(series: np.ndarray, pattern_len: int64) -> np.ndarray:
     """
-    Compute Shannon entropy with parallel histogram computation.
+    Count occurrence of patterns for approximate entropy.
     
-    Args:
-        data: Input data array
-        n_bins: Number of bins for discretization
+    Parameters
+    ----------
+    series : np.ndarray
+        Discretized time series
+    pattern_len : int64
+        Length of patterns to count
         
-    Returns:
-        Shannon entropy in bits
+    Returns
+    -------
+    np.ndarray
+        Pattern counts
+    """
+    n = len(series)
+    if n < pattern_len:
+        return np.array([0.0])
+    
+    # Use dictionary-like approach with fixed size array
+    max_patterns = min(10000, n - pattern_len + 1)
+    counts = np.zeros(max_patterns, dtype=np.float64)
+    pattern_hashes = np.zeros(max_patterns, dtype=np.int64)
+    unique_count = 0
+    
+    for i in range(n - pattern_len + 1):
+        # Create hash of pattern
+        pattern_hash = 0
+        for j in range(pattern_len):
+            pattern_hash = pattern_hash * 31 + series[i + j]
+        
+        # Find or create entry
+        found = False
+        for k in range(unique_count):
+            if pattern_hashes[k] == pattern_hash:
+                counts[k] += 1
+                found = True
+                break
+        
+        if not found and unique_count < max_patterns:
+            pattern_hashes[unique_count] = pattern_hash
+            counts[unique_count] = 1
+            unique_count += 1
+    
+    return counts[:unique_count]
+
+
+@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+def shannon_entropy(data: np.ndarray, bins: int64 = 50) -> float64:
+    """
+    Calculate Shannon entropy of a time series.
+    
+    Parallelized via Numba for SIMD throughput.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    bins : int64
+        Number of bins for discretization
+        
+    Returns
+    -------
+    float64
+        Shannon entropy in nats
     """
     n = len(data)
-    if n == 0:
+    if n < 2:
         return 0.0
     
-    data_min = np.min(data)
-    data_max = np.max(data)
+    # Discretize
+    discrete = _discretize_series(data, bins)
     
-    if data_max - data_min < 1e-12:
-        return 0.0  # Constant signal has zero entropy
+    # Count frequencies
+    freqs = np.zeros(bins, dtype=np.float64)
+    for i in range(n):
+        freqs[discrete[i]] += 1
     
-    hist = _compute_histogram_numba(data, n_bins, data_min, data_max)
+    # Convert to probabilities
+    for i in range(bins):
+        freqs[i] /= n
     
-    # Normalize to probabilities
-    total = np.sum(hist)
-    if total == 0:
-        return 0.0
-    
-    probs = hist / total
-    
-    # Remove zero probabilities
-    non_zero_count = 0
-    for i in range(n_bins):
-        if probs[i] > 0:
-            non_zero_count += 1
-    
-    if non_zero_count == 0:
-        return 0.0
-    
-    entropy = 0.0
-    for i in range(n_bins):
-        p = probs[i]
-        if p > 1e-12:
-            entropy -= p * np.log2(p)
-    
-    return entropy
+    return _shannon_entropy_numba(freqs)
 
 
-def shannon_entropy(data: np.ndarray, n_bins: int = 64) -> float:
+@jit(nopython=True, cache=True, fastmath=True)
+def approximate_entropy(
+    data: np.ndarray,
+    m: int64 = 2,
+    r_factor: float64 = 0.2
+) -> float64:
     """
-    Compute Shannon entropy of a signal.
+    Calculate Approximate Entropy (ApEn) of a time series.
     
-    Measures the average information content or uncertainty in the signal.
-    Higher entropy indicates more complex/unpredictable distributions.
+    ApEn measures regularity/complexity:
+    - Low ApEn: Regular, predictable
+    - High ApEn: Complex, noisy
     
-    Args:
-        data: Input time series or distribution
-        n_bins: Number of bins for discretization
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    m : int64
+        Pattern length (embedding dimension)
+    r_factor : float64
+        Tolerance factor (multiplied by std)
         
-    Returns:
-        Shannon entropy in bits
-    """
-    data = np.asarray(data, dtype=np.float64)
-    return float(_shannon_entropy_parallel(data, n_bins))
-
-
-@jit(nopython=True, cache=True)
-def _match_count_numba(template: np.ndarray, candidate: np.ndarray, 
-                       r: float64) -> int64:
-    """Count matches within tolerance r."""
-    m = len(template)
-    max_dist = 0.0
-    for i in range(m):
-        dist = np.abs(template[i] - candidate[i])
-        if dist > max_dist:
-            max_dist = dist
-    return 1 if max_dist <= r else 0
-
-
-@jit(nopython=True, cache=True, parallel=False)
-def _approximate_entropy_numba(data: np.ndarray, m: int64, r: float64) -> float64:
-    """
-    Compute Approximate Entropy (ApEn) using Numba JIT.
-    
-    ApEn measures the regularity/complexity of a time series.
-    Lower ApEn indicates more regularity/predictability.
-    
-    Args:
-        data: Input time series
-        m: Pattern length (embedding dimension)
-        r: Tolerance threshold (typically 0.1-0.25 * std(data))
-        
-    Returns:
+    Returns
+    -------
+    float64
         Approximate entropy value
     """
     n = len(data)
-    if n <= m:
+    if n < m + 1:
         return 0.0
     
-    # Normalize data
-    data_std = np.std(data)
-    if data_std < 1e-12:
-        return 0.0
+    # Calculate tolerance
+    std = np.std(data)
+    r = r_factor * std if std > 1e-10 else 0.2
     
-    normalized_data = (data - np.mean(data)) / data_std
-    
-    # Count matches for pattern length m
-    phi_m = 0.0
-    count_m = 0
-    
-    for i in range(n - m):
-        template = normalized_data[i:i+m]
-        matches = 0
-        for j in range(n - m):
-            if i != j:
-                max_dist = 0.0
-                for k in range(m):
-                    dist = np.abs(template[k] - normalized_data[j+k])
-                    if dist > max_dist:
-                        max_dist = dist
-                if max_dist <= r:
+    def count_matches(embed_dim: int64) -> float64:
+        """Count matching patterns within tolerance."""
+        total_matches = 0.0
+        n_embed = n - embed_dim + 1
+        
+        for i in range(n_embed):
+            matches = 0
+            for j in range(n_embed):
+                if i == j:
+                    continue
+                
+                # Check if patterns match within tolerance
+                max_diff = 0.0
+                for k in range(embed_dim):
+                    diff = abs(data[i + k] - data[j + k])
+                    if diff > max_diff:
+                        max_diff = diff
+                
+                if max_diff <= r:
                     matches += 1
-        if (n - m - 1) > 0:
-            phi_m += np.log(matches / (n - m - 1))
-        count_m += 1
+            
+            total_matches += matches / (n_embed - 1)
+        
+        return total_matches / n_embed
     
-    phi_m /= count_m if count_m > 0 else 1
-    
-    # Count matches for pattern length m+1
-    phi_m1 = 0.0
-    count_m1 = 0
-    
-    for i in range(n - m - 1):
-        template = normalized_data[i:i+m+1]
-        matches = 0
-        for j in range(n - m - 1):
-            if i != j:
-                max_dist = 0.0
-                for k in range(m + 1):
-                    dist = np.abs(template[k] - normalized_data[j+k])
-                    if dist > max_dist:
-                        max_dist = dist
-                if max_dist <= r:
-                    matches += 1
-        if (n - m - 2) > 0:
-            phi_m1 += np.log(matches / (n - m - 2))
-        count_m1 += 1
-    
-    phi_m1 /= count_m1 if count_m1 > 0 else 1
+    phi_m = np.log(count_matches(m))
+    phi_m1 = np.log(count_matches(m + 1))
     
     apen = phi_m - phi_m1
-    return apen
+    
+    return max(0.0, apen)
 
 
-def approximate_entropy(data: np.ndarray, m: int = 2, r_factor: float = 0.2) -> float:
+@jit(nopython=True, cache=True, fastmath=True)
+def sample_entropy(data: np.ndarray, m: int64 = 2, r_factor: float64 = 0.2) -> float64:
     """
-    Compute Approximate Entropy (ApEn) for market regime detection.
+    Calculate Sample Entropy (SampEn) - improved version of ApEn.
     
-    ApEn quantifies the unpredictability of fluctuations in a time series.
-    - Low ApEn: Regular, predictable market (trending or ranging)
-    - High ApEn: Chaotic, unpredictable market (high volatility, noise)
+    SampEn is less biased than ApEn for short series.
     
-    Args:
-        data: Price returns or other time series
-        m: Pattern length (default 2)
-        r_factor: Tolerance as fraction of standard deviation (default 0.2)
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    m : int64
+        Pattern length
+    r_factor : float64
+        Tolerance factor
         
-    Returns:
-        Approximate entropy value
-    """
-    data = np.asarray(data, dtype=np.float64)
-    r = r_factor * np.std(data)
-    return float(_approximate_entropy_numba(data, m, r))
-
-
-@jit(nopython=True, cache=True, parallel=False)
-def _sample_entropy_numba(data: np.ndarray, m: int64, r: float64) -> float64:
-    """
-    Compute Sample Entropy (SampEn) using Numba JIT.
-    
-    SampEn is similar to ApEn but avoids self-matching bias.
-    More robust for shorter time series.
-    
-    Args:
-        data: Input time series
-        m: Pattern length
-        r: Tolerance threshold
-        
-    Returns:
+    Returns
+    -------
+    float64
         Sample entropy value
     """
     n = len(data)
-    if n <= m:
+    if n < m + 1:
         return 0.0
     
-    # Normalize
-    data_std = np.std(data)
-    if data_std < 1e-12:
-        return 0.0
+    std = np.std(data)
+    r = r_factor * std if std > 1e-10 else 0.2
     
-    normalized_data = (data - np.mean(data)) / data_std
+    def count_similar_pairs(embed_dim: int64) -> Tuple[int64, int64]:
+        """Count similar pattern pairs."""
+        n_embed = n - embed_dim
+        num_pairs = 0
+        num_matches = 0
+        
+        for i in range(n_embed):
+            for j in range(i + 1, n_embed):
+                num_pairs += 1
+                
+                # Check match
+                max_diff = 0.0
+                for k in range(embed_dim):
+                    diff = abs(data[i + k] - data[j + k])
+                    if diff > max_diff:
+                        max_diff = diff
+                
+                if max_diff <= r:
+                    num_matches += 1
+        
+        return num_pairs, num_matches
     
-    # Count matches for length m (excluding self-matches)
-    def count_matches(length):
-        count = 0
-        total = 0
-        for i in range(n - length):
-            for j in range(i + 1, n - length):
-                max_dist = 0.0
-                for k in range(length):
-                    dist = np.abs(normalized_data[i+k] - normalized_data[j+k])
-                    if dist > max_dist:
-                        max_dist = dist
-                if max_dist <= r:
-                    count += 1
-                total += 1
-        return count, total
+    pairs_m, matches_m = count_similar_pairs(m)
+    pairs_m1, matches_m1 = count_similar_pairs(m + 1)
     
-    count_m, total_m = count_matches(m)
-    count_m1, total_m1 = count_matches(m + 1)
-    
-    if count_m == 0 or count_m1 == 0:
-        return 0.0
+    if matches_m1 == 0 or pairs_m == 0 or pairs_m1 == 0:
+        return 2.0  # Maximum entropy indicator
     
     # SampEn = -log(A/B) where A and B are match probabilities
-    sampen = -np.log((count_m1 / total_m1) / (count_m / total_m))
-    return sampen
-
-
-def sample_entropy(data: np.ndarray, m: int = 2, r_factor: float = 0.2) -> float:
-    """
-    Compute Sample Entropy (SampEn) for robust complexity measurement.
+    prob_m = matches_m / pairs_m if pairs_m > 0 else 0
+    prob_m1 = matches_m1 / pairs_m1 if pairs_m1 > 0 else 0
     
-    Args:
-        data: Input time series
-        m: Pattern length
-        r_factor: Tolerance as fraction of std
+    if prob_m1 < 1e-10:
+        return 2.0
+    
+    sampen = -np.log(prob_m1 / prob_m)
+    
+    return max(0.0, sampen)
+
+
+@jit(nopython=True, parallel=True, cache=True, fastmath=True)
+def permutation_entropy(data: np.ndarray, dim: int64 = 3, delay: int64 = 1) -> float64:
+    """
+    Calculate Permutation Entropy - measures ordinal pattern complexity.
+    
+    Robust to noise and computationally efficient.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    dim : int64
+        Embedding dimension (typically 3-7)
+    delay : int64
+        Time delay between samples
         
-    Returns:
-        Sample entropy value
-    """
-    data = np.asarray(data, dtype=np.float64)
-    r = r_factor * np.std(data)
-    return float(_sample_entropy_numba(data, m, r))
-
-
-@jit(nopython=True, cache=True, parallel=True)
-def _permutation_entropy_numba(data: np.ndarray, order: int64, delay: int64) -> float64:
-    """
-    Compute Permutation Entropy using Numba JIT.
-    
-    Permutation entropy measures the complexity based on ordinal patterns.
-    Robust to noise and monotonic transformations.
-    
-    Args:
-        data: Input time series
-        order: Order of permutation (typically 3-7)
-        delay: Time delay between elements
-        
-    Returns:
-        Permutation entropy in bits
+    Returns
+    -------
+    float64
+        Permutation entropy (normalized 0-1)
     """
     n = len(data)
-    if n <= order * delay:
+    if n < dim * delay:
         return 0.0
     
     # Number of possible permutations
     n_perms = 1
-    for i in range(1, order + 1):
+    for i in range(1, dim + 1):
         n_perms *= i
     
     # Count permutation patterns
     perm_counts = np.zeros(n_perms, dtype=np.float64)
+    n_vectors = n - (dim - 1) * delay
     
-    for i in range(n - (order - 1) * delay):
-        # Extract pattern
-        pattern = np.zeros(order, dtype=np.int64)
-        for j in range(order):
-            pattern[j] = i + j * delay
+    for i in range(n_vectors):
+        # Extract pattern indices
+        pattern = np.zeros(dim, dtype=np.int64)
+        for d in range(dim):
+            pattern[d] = i + d * delay
         
-        # Compute rank order (permutation index)
+        # Determine ordinal pattern (rank ordering)
+        # Simple bubble sort for ranking
+        rank = np.zeros(dim, dtype=np.int64)
+        for d in range(dim):
+            rank[d] = d
+        
+        for a in range(dim - 1):
+            for b in range(a + 1, dim):
+                if data[pattern[rank[a]]] > data[pattern[rank[b]]]:
+                    tmp = rank[a]
+                    rank[a] = rank[b]
+                    rank[b] = tmp
+        
+        # Convert rank to permutation index
         perm_idx = 0
         factorial = 1
-        for j in range(order):
-            count_smaller = 0
-            for k in range(j + 1, order):
-                if data[pattern[j]] > data[pattern[k]]:
-                    count_smaller += 1
-            perm_idx += count_smaller * factorial
-            factorial *= (j + 1)
+        for d in range(dim):
+            count = 0
+            for e in range(d):
+                if rank[e] < rank[d]:
+                    count += 1
+            perm_idx += count * factorial
+            factorial *= (d + 1)
         
         if perm_idx < n_perms:
             perm_counts[perm_idx] += 1
     
     # Normalize to probabilities
     total = np.sum(perm_counts)
-    if total == 0:
+    if total < 1e-10:
         return 0.0
     
     probs = perm_counts / total
     
-    # Compute entropy
+    # Calculate entropy
     entropy = 0.0
-    for i in range(n_perms):
-        p = probs[i]
-        if p > 1e-12:
-            entropy -= p * np.log2(p)
+    for p in probs:
+        if p > 1e-10:
+            entropy -= p * np.log(p)
     
     # Normalize by maximum entropy
-    max_entropy = np.log2(n_perms)
-    if max_entropy > 0:
+    max_entropy = np.log(n_perms)
+    if max_entropy > 1e-10:
         entropy /= max_entropy
     
-    return entropy
+    return min(1.0, max(0.0, entropy))
 
 
-def permutation_entropy(data: np.ndarray, order: int = 5, delay: int = 1) -> float:
+@jit(nopython=True, cache=True, fastmath=True)
+def spectral_entropy(data: np.ndarray, normalize: bool = True) -> float64:
     """
-    Compute Permutation Entropy for ordinal pattern complexity.
+    Calculate Spectral Entropy from FFT power spectrum.
     
-    Args:
-        data: Input time series
-        order: Order of permutation (3-7 recommended)
-        delay: Time delay between elements
+    Measures frequency domain complexity.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series
+    normalize : bool
+        If True, normalize to [0, 1]
         
-    Returns:
-        Normalized permutation entropy [0, 1]
+    Returns
+    -------
+    float64
+        Spectral entropy
     """
-    data = np.asarray(data, dtype=np.float64)
-    return float(_permutation_entropy_numba(data, order, delay))
+    n = len(data)
+    if n < 4:
+        return 0.0
+    
+    # Remove mean
+    data_centered = data - np.mean(data)
+    
+    # Simple DFT magnitude (Numba-compatible)
+    n_freq = n // 2
+    power = np.zeros(n_freq, dtype=np.float64)
+    
+    for k in range(n_freq):
+        real_sum = 0.0
+        imag_sum = 0.0
+        for t in range(n):
+            angle = 2.0 * np.pi * k * t / n
+            real_sum += data_centered[t] * np.cos(angle)
+            imag_sum -= data_centered[t] * np.sin(angle)
+        power[k] = (real_sum * real_sum + imag_sum * imag_sum) / n
+    
+    # Normalize to probability distribution
+    total_power = np.sum(power)
+    if total_power < 1e-10:
+        return 0.0
+    
+    probs = power / total_power
+    
+    # Calculate entropy
+    entropy = 0.0
+    for p in probs:
+        if p > 1e-10:
+            entropy -= p * np.log(p)
+    
+    if normalize:
+        max_entropy = np.log(n_freq)
+        if max_entropy > 1e-10:
+            entropy /= max_entropy
+    
+    return min(1.0, max(0.0, entropy))
 
 
-class EntropyRegimeDetector:
+class MarketRegimeClassifier:
     """
-    Multi-metric entropy-based market regime detector.
+    Classify market regimes using entropy metrics.
     
-    Combines multiple entropy measures to classify market states:
-    - Low Signal (high noise, random walk)
-    - Trending (low entropy, directional)
-    - Ranging (medium entropy, mean-reverting)
-    - Chaotic (very high entropy, unpredictable)
+    Regimes:
+    - LOW_VOLATILITY: Low entropy, predictable
+    - HIGH_VOLATILITY: High entropy, chaotic
+    - TRENDING: Medium entropy with directional bias
+    - MEAN_REVERTING: Low-medium entropy, oscillating
     """
     
-    def __init__(self, window_size: int = 100, memory_limit_mb: int = 3800):
-        """
-        Initialize regime detector.
-        
-        Args:
-            window_size: Rolling window size for analysis
-            memory_limit_mb: Memory limit in MB
-        """
+    REGIME_NAMES = ['low_volatility', 'high_volatility', 'trending', 'mean_reverting']
+    
+    def __init__(self, window_size: int = 100):
         self.window_size = window_size
-        self.memory_limit_mb = memory_limit_mb
-        self.acceleration = check_amd_acceleration()
+        self.accel_info = check_amd_acceleration()
     
-    def _check_memory(self):
-        """Validate memory usage."""
-        import psutil
-        process = psutil.Process(os.getpid())
-        current_mem_mb = process.memory_info().rss / (1024 * 1024)
-        if current_mem_mb > self.memory_limit_mb:
-            raise MemoryError(f"Memory {current_mem_mb:.0f}MB exceeds limit {self.memory_limit_mb}MB")
-    
-    def compute_all_entropies(self, data: np.ndarray) -> Dict[str, float]:
+    def classify(self, returns: np.ndarray) -> Dict[str, any]:
         """
-        Compute all entropy metrics for a signal.
+        Classify market regime based on entropy features.
         
-        Args:
-            data: Input time series
+        Parameters
+        ----------
+        returns : np.ndarray
+            Price returns time series
             
-        Returns:
-            Dictionary of entropy metrics
+        Returns
+        -------
+        dict
+            Classification results with regime name and confidence
         """
-        data = np.asarray(data, dtype=np.float64)
+        if len(returns) < self.window_size:
+            return {'regime': 'unknown', 'confidence': 0.0}
         
-        results = {
-            'shannon_entropy': shannon_entropy(data, n_bins=64),
-            'approximate_entropy': approximate_entropy(data, m=2, r_factor=0.2),
-            'sample_entropy': sample_entropy(data, m=2, r_factor=0.2),
-            'permutation_entropy': permutation_entropy(data, order=5, delay=1),
-            'acceleration': self.acceleration
-        }
+        # Use recent window
+        window = returns[-self.window_size:]
         
-        self._check_memory()
-        return results
-    
-    def classify_regime(self, data: np.ndarray) -> Tuple[str, Dict[str, float]]:
-        """
-        Classify market regime based on entropy metrics.
+        # Calculate entropy features
+        shannon = shannon_entropy(window, bins=20)
+        apen = approximate_entropy(window, m=2, r_factor=0.2)
+        sampen = sample_entropy(window, m=2, r_factor=0.2)
+        perm_en = permutation_entropy(window, dim=3, delay=1)
+        spec_en = spectral_entropy(window)
         
-        Args:
-            data: Price returns or other signal
-            
-        Returns:
-            Tuple of (regime_name, metrics_dict)
-        """
-        metrics = self.compute_all_entropies(data)
+        # Composite entropy score
+        composite = (shannon + perm_en + spec_en) / 3.0
         
-        pe = metrics['permutation_entropy']
-        se = metrics['sample_entropy']
-        ae = metrics['approximate_entropy']
+        # Volatility
+        vol = np.std(window)
         
-        # Normalize metrics for classification
-        avg_complexity = (pe + min(se, 2.0) / 2.0) / 2.0
-        
-        if pe > 0.9 and ae > 1.5:
-            regime = 'chaotic'
-            confidence = min(pe, 1.0)
-        elif pe < 0.4 and ae < 0.5:
+        # Classify regime
+        if composite < 0.3 and vol < 0.01:
+            regime = 'low_volatility'
+            confidence = 1.0 - composite
+        elif composite > 0.7 or vol > 0.03:
+            regime = 'high_volatility'
+            confidence = composite
+        elif vol > 0.015 and np.mean(returns[-50:]) > 0.001:
             regime = 'trending'
-            confidence = 1.0 - pe
-        elif 0.4 <= pe <= 0.7 and ae < 1.0:
-            regime = 'ranging'
-            confidence = 1.0 - abs(pe - 0.55) * 2
+            confidence = 0.6
         else:
-            regime = 'low_signal'
+            regime = 'mean_reverting'
             confidence = 0.5
         
-        metrics['classified_regime'] = regime
-        metrics['regime_confidence'] = confidence
-        
-        return regime, metrics
+        return {
+            'regime': regime,
+            'confidence': confidence,
+            'features': {
+                'shannon_entropy': shannon,
+                'approximate_entropy': apen,
+                'sample_entropy': sampen,
+                'permutation_entropy': perm_en,
+                'spectral_entropy': spec_en,
+                'volatility': vol
+            },
+            'is_low_signal': composite < 0.2  # Filter for RL agent
+        }
+
+
+@ray.remote(max_calls=10)
+class DistributedEntropyCalculator:
+    """Ray actor for distributed entropy calculations."""
     
-    def rolling_entropy_analysis(self, data: np.ndarray, 
-                                  step: int = 10) -> List[Dict]:
-        """
-        Compute rolling entropy analysis over time.
+    def __init__(self, memory_limit_mb: int = MAX_MEMORY_MB):
+        self.memory_limit_mb = memory_limit_mb
+        self.accel_info = check_amd_acceleration()
+    
+    def calculate_all_entropies(
+        self,
+        data: np.ndarray,
+        symbols: List[str]
+    ) -> Dict[str, Dict[str, float]]:
+        """Calculate all entropy metrics for multiple symbols."""
+        results = {}
         
-        Args:
-            data: Full time series
-            step: Step size between windows
+        for i, symbol in enumerate(symbols):
+            series = data[:, i] if len(data.shape) > 1 else data
             
-        Returns:
-            List of analysis results for each window
-        """
-        n = len(data)
-        results = []
-        
-        for start in range(0, n - self.window_size, step):
-            window = data[start:start + self.window_size]
-            regime, metrics = self.classify_regime(window)
-            
-            results.append({
-                'timestamp_index': start,
-                'regime': regime,
-                **metrics
-            })
-            
-            self._check_memory()
+            results[symbol] = {
+                'shannon': float(shannon_entropy(series, bins=30)),
+                'approximate': float(approximate_entropy(series)),
+                'sample': float(sample_entropy(series)),
+                'permutation': float(permutation_entropy(series)),
+                'spectral': float(spectral_entropy(series))
+            }
         
         return results
     
-    def filter_low_signal_periods(self, data: np.ndarray, 
-                                   threshold: float = 0.7) -> np.ndarray:
-        """
-        Filter out low-signal periods unsuitable for RL training.
-        
-        Args:
-            data: Full time series
-            threshold: Permutation entropy threshold for filtering
-            
-        Returns:
-            Boolean mask indicating valid (high-signal) periods
-        """
-        n = len(data)
-        mask = np.ones(n, dtype=bool)
-        
-        for start in range(0, n - self.window_size, self.window_size // 2):
-            window = data[start:start + self.window_size]
-            pe = permutation_entropy(window)
-            
-            if pe < threshold:
-                # Mark this window as low signal
-                end = min(start + self.window_size, n)
-                mask[start:end] = False
-        
-        return mask
+    def get_stats(self) -> Dict:
+        return {
+            'acceleration': self.accel_info,
+            'memory_limit_mb': self.memory_limit_mb
+        }
 
 
-if __name__ == '__main__':
-    print("Checking AMD acceleration...")
-    accel = check_amd_acceleration()
-    print(f"Acceleration: {accel}")
+if __name__ == "__main__":
+    print("AMD Acceleration:", check_amd_acceleration())
     
-    # Example usage with synthetic data
+    # Test with sample data
     np.random.seed(42)
     
-    # Generate different market regimes
-    trending = np.cumsum(np.random.randn(500) + 0.1)
-    ranging = np.sin(np.linspace(0, 20, 500)) + np.random.randn(500) * 0.1
-    chaotic = np.cumsum(np.random.randn(500) * 2)
+    # Generate different types of series
+    random_series = np.random.randn(1000)
+    trend_series = np.cumsum(np.random.randn(1000) * 0.01)
+    mean_rev = np.sin(np.linspace(0, 20*np.pi, 1000)) + np.random.randn(1000) * 0.1
     
-    detector = EntropyRegimeDetector(window_size=100)
+    print(f"\nRandom Series:")
+    print(f"  Shannon: {shannon_entropy(random_series):.4f}")
+    print(f"  Approx En: {approximate_entropy(random_series):.4f}")
+    print(f"  Sample En: {sample_entropy(random_series):.4f}")
+    print(f"  Perm En: {permutation_entropy(random_series):.4f}")
     
-    print("\nTrending regime:")
-    regime, metrics = detector.classify_regime(np.diff(trending))
-    print(f"  Classified: {regime} (confidence: {metrics['regime_confidence']:.2f})")
-    
-    print("\nRanging regime:")
-    regime, metrics = detector.classify_regime(ranging)
-    print(f"  Classified: {regime} (confidence: {metrics['regime_confidence']:.2f})")
-    
-    print("\nChaotic regime:")
-    regime, metrics = detector.classify_regime(np.diff(chaotic))
-    print(f"  Classified: {regime} (confidence: {metrics['regime_confidence']:.2f})")
+    print(f"\nTrend Series:")
+    classifier = MarketRegimeClassifier()
+    returns = np.diff(trend_series) / trend_series[:-1]
+    result = classifier.classify(returns)
+    print(f"  Regime: {result['regime']}")
+    print(f"  Confidence: {result['confidence']:.4f}")
+    print(f"  Low Signal: {result['is_low_signal']}")

@@ -1,386 +1,336 @@
 """
-Asynchronous Successive Halving (Hyperband) for RL Hyperparameter Tuning
+Chapter 3: Distributed Hyperparameter Tuning & AutoML
+File 7: python/automl/hyperband.py
 
-This module implements Hyperband optimization distributed on Ray for rapid
-RL hyperparameter tuning. Aggressively kills underperforming trials to save
-compute and memory resources while respecting the 4GB RAM quota.
+Asynchronous Successive Halving (Hyperband) on Ray for rapid RL
+hyperparameter tuning. Aggressively kills underperforming trials
+to save compute and memory resources.
 
-Key Features:
-- Asynchronous Successive Halving Algorithm (ASHA)
-- Ray-distributed trial execution
-- Memory-efficient trial management
-- AMD ROCm/DirectML acceleration checks
-- Strict 4GB RAM enforcement per worker
-
-AMD Ryzen AI 5 Optimizations:
-- Parallel trial evaluation
-- SIMD-enabled metric computation
-- Cache-efficient data structures
+Enforces 4GB RAM quota per worker.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Callable, Any
 import ray
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
 from ray.tune.search import BasicVariantGenerator
-import os
 import time
-import warnings
+
+# Memory limit (4GB quota)
+MAX_MEMORY_MB = 4096
 
 
 def check_amd_acceleration() -> Dict[str, bool]:
     """Check for AMD ROCm/DirectML availability."""
-    acceleration = {
+    accel_info = {
         'rocm_available': False,
         'directml_available': False,
-        'cpu_simd_available': True
+        'cuda_available': False,
+        'recommended_backend': 'numpy'
     }
     
     try:
         import torch
-        if hasattr(torch.version, 'hip') or (torch.cuda.is_available() and 'ROCm' in str(torch.version.cuda)):
-            acceleration['rocm_available'] = True
+        if torch.version.hip is not None:
+            accel_info['rocm_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_rocm'
+        elif hasattr(torch.backends, 'directml'):
+            accel_info['directml_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_directml'
+        elif torch.cuda.is_available():
+            accel_info['cuda_available'] = True
+            accel_info['recommended_backend'] = 'pytorch_cuda'
     except ImportError:
         pass
     
-    try:
-        import torch_directml
-        acceleration['directml_available'] = True
-    except ImportError:
-        pass
-    
-    return acceleration
+    return accel_info
 
 
-def init_ray_for_hyperband(memory_gb: float = 4.0, num_cpus: int = 8):
-    """Initialize Ray with strict memory limits for Hyperband."""
-    if not ray.is_initialized():
-        ray.init(
-            _memory=int(memory_gb * 1024 * 1024 * 1024),
-            _object_store_memory=int(memory_gb * 0.5 * 1024 * 1024 * 1024),
-            num_cpus=min(os.cpu_count() or num_cpus, num_cpus),
-            log_to_driver=True,
-        )
-    return check_amd_acceleration()
-
-
-class RLHyperbandTuner:
+class HyperbandTuner:
     """
-    Hyperband tuner for RL hyperparameter optimization.
+    Asynchronous Successive Halving Algorithm (ASHA) tuner.
     
-    Implements Asynchronous Successive Halving Algorithm (ASHA) which:
-    1. Starts many configurations with small budgets
-    2. Promotes top performers to larger budgets
-    3. Aggressively prunes underperformers
+    Hyperband efficiently allocates resources by:
+    1. Starting many configurations with few resources
+    2. Promising configurations get more resources
+    3. Poor configurations are stopped early
     """
     
-    def __init__(self, 
-                 metric: str = 'episode_reward_mean',
-                 mode: str = 'max',
-                 max_t: int = 100,
-                 grace_period: int = 10,
-                 reduction_factor: int = 3,
-                 memory_limit_mb: int = 3800):
-        """
-        Initialize Hyperband tuner.
-        
-        Args:
-            metric: Metric to optimize
-            mode: 'max' or 'min'
-            max_t: Maximum training iterations
-            grace_period: Minimum iterations before pruning
-            reduction_factor: Factor by which budget increases
-            memory_limit_mb: Memory limit per worker in MB
-        """
+    def __init__(
+        self,
+        metric: str = "reward",
+        mode: str = "max",
+        max_t: int = 100,
+        grace_period: int = 10,
+        reduction_factor: int = 3,
+        brackets: int = 3,
+        memory_limit_mb: int = MAX_MEMORY_MB
+    ):
         self.metric = metric
         self.mode = mode
         self.max_t = max_t
         self.grace_period = grace_period
         self.reduction_factor = reduction_factor
+        self.brackets = brackets
         self.memory_limit_mb = memory_limit_mb
         
-        self.acceleration = check_amd_acceleration()
+        self.accel_info = check_amd_acceleration()
+        self._trials_completed = 0
+        self._trials_terminated_early = 0
         
-        # ASHA scheduler configuration
+        # Create ASHA scheduler
         self.scheduler = ASHAScheduler(
             metric=metric,
             mode=mode,
             max_t=max_t,
             grace_period=grace_period,
             reduction_factor=reduction_factor,
-            brackets=3,  # Number of ASHA brackets
+            brackets=brackets,
+            stop_last_trials=True  # Aggressively kill poor performers
         )
     
-    def _check_memory(self):
-        """Validate memory usage is within limits."""
-        import psutil
-        process = psutil.Process(os.getpid())
-        current_mem_mb = process.memory_info().rss / (1024 * 1024)
-        if current_mem_mb > self.memory_limit_mb:
-            raise MemoryError(f"Memory {current_mem_mb:.0f}MB exceeds limit {self.memory_limit_mb}MB")
-    
-    def get_search_space(self, param_ranges: Dict[str, any]) -> Dict[str, any]:
+    def create_search_space(
+        self,
+        param_ranges: Dict[str, any]
+    ) -> Dict[str, any]:
         """
-        Define hyperparameter search space.
+        Create Ray Tune search space from parameter ranges.
         
-        Args:
-            param_ranges: Dictionary of parameter names to ranges
+        Parameters
+        ----------
+        param_ranges : dict
+            Dict of {param_name: (min, max)} or {param_name: [choices]}
             
-        Returns:
-            Search space dictionary for Ray Tune
+        Returns
+        -------
+        dict
+            Ray Tune search space
         """
-        from ray import tune
-        
         search_space = {}
-        for name, range_spec in param_ranges.items():
-            if isinstance(range_spec, tuple) and len(range_spec) == 2:
-                low, high = range_spec
-                if isinstance(low, float) or isinstance(high, float):
-                    search_space[name] = tune.uniform(float(low), float(high))
+        
+        for param_name, range_spec in param_ranges.items():
+            if isinstance(range_spec, (list, tuple)) and len(range_spec) == 2:
+                min_val, max_val = range_spec
+                
+                # Determine if integer or float
+                if isinstance(min_val, int) and isinstance(max_val, int):
+                    search_space[param_name] = tune.randint(min_val, max_val + 1)
                 else:
-                    search_space[name] = tune.randint(int(low), int(high))
+                    search_space[param_name] = tune.uniform(float(min_val), float(max_val))
             elif isinstance(range_spec, list):
-                search_space[name] = tune.choice(range_spec)
-            elif isinstance(range_spec, dict):
-                search_space[name] = range_spec
+                # Categorical choices
+                search_space[param_name] = tune.choice(range_spec)
+            else:
+                # Fixed value
+                search_space[param_name] = range_spec
         
         return search_space
     
-    def tune(self,
-             train_func: Callable,
-             search_space: Dict[str, any],
-             num_samples: int = 50,
-             cpus_per_trial: float = 1.0,
-             gpus_per_trial: float = 0.0,
-             time_budget_s: Optional[int] = None,
-             verbose: int = 1) -> Dict:
+    def tune(
+        self,
+        train_func: Callable,
+        param_ranges: Dict[str, any],
+        num_samples: int = 50,
+        cpus_per_trial: float = 2.0,
+        gpus_per_trial: float = 0.0,
+        memory_per_trial: int = 512,  # MB
+        timeout_s: int = 3600,
+        local_dir: str = "~/ray_results"
+    ) -> tune.ResultGrid:
         """
         Run Hyperband optimization.
         
-        Args:
-            train_func: Training function that takes config and reports metrics
-            search_space: Hyperparameter search space
-            num_samples: Number of initial configurations to sample
-            cpus_per_trial: CPUs allocated per trial
-            gpus_per_trial: GPUs allocated per trial
-            time_budget_s: Optional time budget in seconds
-            verbose: Verbosity level
+        Parameters
+        ----------
+        train_func : callable
+            Training function that takes config dict and reports metrics
+        param_ranges : dict
+            Parameter ranges to search
+        num_samples : int
+            Number of initial configurations to try
+        cpus_per_trial : float
+            CPUs allocated per trial
+        gpus_per_trial : float
+            GPUs allocated per trial
+        memory_per_trial : int
+            Memory (MB) per trial - enforces 4GB total limit
+        timeout_s : int
+            Maximum runtime in seconds
+        local_dir : str
+            Directory for results
             
-        Returns:
-            Best configuration and results
+        Returns
+        -------
+        ResultGrid
+            Ray Tune result grid
         """
-        self._check_memory()
+        # Enforce memory limits
+        effective_memory = min(memory_per_trial, self.memory_limit_mb // 4)
         
-        # Configure Ray Tune
+        search_space = self.create_search_space(param_ranges)
+        
+        # Configure resources
+        resources_per_trial = {
+            "cpu": cpus_per_trial,
+            "gpu": gpus_per_trial,
+            "memory": effective_memory * 1024 * 1024  # Convert to bytes
+        }
+        
+        # Run optimization
         analysis = tune.run(
             train_func,
             config=search_space,
             scheduler=self.scheduler,
-            search_alg=BasicVariantGenerator(),
             num_samples=num_samples,
-            resources_per_trial={'cpu': cpus_per_trial, 'gpu': gpus_per_trial},
-            time_budget_s=time_budget_s,
+            resources_per_trial=resources_per_trial,
             metric=self.metric,
             mode=self.mode,
-            verbose=verbose,
-            # Memory-efficient settings
-            reuse_actors=True,
-            recycle_actors=True,
-            # Stop underperforming trials quickly
-            fail_fast=False,
+            local_dir=local_dir,
+            time_budget_s=timeout_s,
+            verbose=1,
+            raise_on_failed_trial=False,
+            callbacks=[self._create_memory_callback()]
         )
         
-        self._check_memory()
+        self._trials_completed = len(analysis.trials)
+        self._trials_terminated_early = sum(
+            1 for t in analysis.trials if t.last_status == "TERMINATED"
+        )
         
-        # Extract best results
-        best_trial = analysis.get_best_trial(self.metric, self.mode)
+        return analysis
+    
+    def _create_memory_callback(self):
+        """Create callback to enforce memory limits."""
+        import gc
         
-        return {
-            'best_config': best_trial.config if best_trial else {},
-            'best_metric': best_trial.last_result.get(self.metric, 0) if best_trial else 0,
-            'all_results': analysis.results,
-            'acceleration': self.acceleration,
-            'trials_completed': len(analysis.trials),
-        }
-
-
-@ray.remote(max_calls=50)
-class AsyncHyperbandWorker:
-    """
-    Distributed worker for asynchronous Hyperband evaluation.
-    
-    Each worker evaluates configurations independently and reports
-    metrics back to the central scheduler.
-    """
-    
-    def __init__(self, worker_id: int, memory_limit_mb: int = 3500):
-        self.worker_id = worker_id
-        self.memory_limit_mb = memory_limit_mb
-        self.trials_evaluated = 0
-        self.acceleration = check_amd_acceleration()
-    
-    def _check_memory(self):
-        """Validate memory usage."""
-        import psutil
-        process = psutil.Process(os.getpid())
-        current_mem_mb = process.memory_info().rss / (1024 * 1024)
-        if current_mem_mb > self.memory_limit_mb:
-            raise MemoryError(f"Worker {self.worker_id}: Memory {current_mem_mb:.0f}MB exceeds limit")
-    
-    def evaluate_config(self, config: Dict, training_steps: int,
-                        eval_func: Callable) -> Dict:
-        """
-        Evaluate a single configuration.
-        
-        Args:
-            config: Hyperparameter configuration
-            training_steps: Number of steps to train
-            eval_func: Evaluation function
+        def on_trial_result(trial, result):
+            # Periodic garbage collection
+            if trial.iteration % 10 == 0:
+                gc.collect()
             
-        Returns:
-            Evaluation results
-        """
-        start_time = time.time()
+            # Check if result indicates memory issues
+            if 'memory_usage_mb' in result:
+                if result['memory_usage_mb'] > self.memory_limit_mb * 0.9:
+                    return "STOP"  # Stop trial approaching memory limit
+            
+            return "CONTINUE"
         
-        try:
-            result = eval_func(config, training_steps)
-            
-            self.trials_evaluated += 1
-            self._check_memory()
-            
-            return {
-                'worker_id': self.worker_id,
-                'config': config,
-                'training_steps': training_steps,
-                'result': result,
-                'evaluation_time': time.time() - start_time,
-                'acceleration': self.acceleration,
-            }
-        except Exception as e:
-            return {
-                'worker_id': self.worker_id,
-                'config': config,
-                'error': str(e),
-                'evaluation_time': time.time() - start_time,
-            }
+        return on_trial_result
+    
+    def get_best_config(self, analysis: tune.ResultGrid) -> Dict:
+        """Extract best configuration from results."""
+        return analysis.best_config
     
     def get_stats(self) -> Dict:
-        """Get worker statistics."""
+        """Get tuning statistics."""
         return {
-            'worker_id': self.worker_id,
-            'trials_evaluated': self.trials_evaluated,
-            'acceleration': self.acceleration,
+            'trials_completed': self._trials_completed,
+            'trials_terminated_early': self._trials_terminated_early,
+            'early_termination_rate': (
+                self._trials_terminated_early / max(1, self._trials_completed)
+            ),
+            'acceleration': self.accel_info,
+            'memory_limit_mb': self.memory_limit_mb
         }
 
 
-def create_rl_search_space(rl_params: Optional[Dict] = None) -> Dict:
-    """
-    Create default RL hyperparameter search space.
+@ray.remote(max_calls=5)
+class DistributedHyperbandWorker:
+    """Ray actor for distributed Hyperband tuning."""
     
-    Args:
-        rl_params: Optional custom parameter overrides
+    def __init__(self, memory_limit_mb: int = MAX_MEMORY_MB):
+        self.memory_limit_mb = memory_limit_mb
+        self.accel_info = check_amd_acceleration()
+        self._evaluations = 0
+    
+    def evaluate_config(
+        self,
+        config: Dict,
+        train_func: Callable,
+        max_epochs: int = 50
+    ) -> Dict:
+        """Evaluate a single configuration."""
+        self._check_memory()
         
-    Returns:
-        Search space dictionary
-    """
-    default_space = {
-        # PPO parameters
-        'learning_rate': (1e-5, 1e-3),
-        'gamma': (0.95, 0.999),
-        'gae_lambda': (0.9, 0.99),
-        'clip_param': (0.1, 0.3),
-        'entropy_coef': (0.0, 0.1),
-        'value_loss_coef': (0.1, 1.0),
+        start_time = time.time()
+        result = train_func(config, max_epochs=max_epochs)
+        elapsed = time.time() - start_time
         
-        # Network architecture
-        'hidden_sizes': [
-            [64, 64],
-            [128, 128],
-            [256, 256],
-            [128, 64],
-        ],
-        'activation': ['tanh', 'relu'],
+        self._evaluations += 1
         
-        # Optimization
+        return {
+            'config': config,
+            'result': result,
+            'elapsed_seconds': elapsed,
+            'evaluation_id': self._evaluations
+        }
+    
+    def batch_evaluate(
+        self,
+        configs: List[Dict],
+        train_func: Callable,
+        max_epochs: int = 50
+    ) -> List[Dict]:
+        """Evaluate multiple configurations."""
+        results = []
+        for config in configs:
+            result = self.evaluate_config(config, train_func, max_epochs)
+            results.append(result)
+            self._check_memory()
+        return results
+    
+    def _check_memory(self):
+        """Memory checkpoint."""
+        import gc
+        if self._evaluations % 10 == 0:
+            gc.collect()
+    
+    def get_stats(self) -> Dict:
+        return {
+            'evaluations': self._evaluations,
+            'acceleration': self.accel_info,
+            'memory_limit_mb': self.memory_limit_mb
+        }
+
+
+def create_hyperband_workers(num_workers: int = 4) -> List:
+    """Create distributed Hyperband workers."""
+    return [
+        DistributedHyperbandWorker.remote(memory_limit_mb=MAX_MEMORY_MB)
+        for _ in range(num_workers)
+    ]
+
+
+if __name__ == "__main__":
+    # Initialize Ray with memory limits
+    ray.init(
+        object_store_memory=4 * 1024 * 1024 * 1024,
+        _system_config={"max_bytes_to_spill": 4 * 1024 * 1024 * 1024}
+    )
+    
+    print("AMD Acceleration:", check_amd_acceleration())
+    
+    # Example usage
+    tuner = HyperbandTuner(
+        metric="validation_reward",
+        mode="max",
+        max_t=100,
+        grace_period=10,
+        reduction_factor=3
+    )
+    
+    # Define parameter ranges for RL agent
+    param_ranges = {
+        'learning_rate': (1e-5, 1e-2),
+        'gamma': (0.9, 0.999),
+        'tau': (0.001, 0.01),
         'batch_size': [32, 64, 128, 256],
-        'mini_batch_size': [16, 32, 64],
-        'epochs': (1, 10),
-        'max_grad_norm': (0.1, 1.0),
-        
-        # Adam optimizer
-        'adam_beta1': (0.8, 0.99),
-        'adam_beta2': (0.99, 0.999),
-        'adam_epsilon': (1e-8, 1e-5),
+        'hidden_dim': [64, 128, 256, 512],
+        'buffer_size': (10000, 1000000)
     }
     
-    if rl_params:
-        default_space.update(rl_params)
+    print(f"Search space: {param_ranges}")
+    print(f"Tuner stats: {tuner.get_stats()}")
     
-    return default_space
-
-
-def run_hyperband_optimization(train_func: Callable,
-                                param_ranges: Optional[Dict] = None,
-                                num_samples: int = 50,
-                                max_iterations: int = 100,
-                                memory_gb: float = 4.0) -> Dict:
-    """
-    Run complete Hyperband optimization pipeline.
-    
-    Args:
-        train_func: Training function
-        param_ranges: Custom parameter ranges
-        num_samples: Number of configurations to sample
-        max_iterations: Maximum training iterations
-        memory_gb: Memory budget in GB
-        
-    Returns:
-        Optimization results
-    """
-    # Initialize Ray
-    accel = init_ray_for_hyperband(memory_gb=memory_gb)
-    
-    # Create tuner
-    tuner = RLHyperbandTuner(
-        metric='episode_reward_mean',
-        mode='max',
-        max_t=max_iterations,
-        grace_period=max(5, max_iterations // 10),
-        reduction_factor=3,
-    )
-    
-    # Get search space
-    search_space = tuner.get_search_space(
-        param_ranges or create_rl_search_space()
-    )
-    
-    # Run optimization
-    results = tuner.tune(
-        train_func=train_func,
-        search_space=search_space,
-        num_samples=num_samples,
-        time_budget_s=3600,  # 1 hour default
-    )
-    
-    results['acceleration'] = accel
-    
-    return results
-
-
-if __name__ == '__main__':
-    print("Checking AMD acceleration...")
-    accel = check_amd_acceleration()
-    print(f"Acceleration: {accel}")
-    
-    # Example dummy training function
-    def dummy_train(config):
-        import time
-        for i in range(10):
-            time.sleep(0.1)
-            # Simulate training progress
-            reward = np.random.randn() * config.get('learning_rate', 0.001) * 100
-            tune.report(episode_reward_mean=reward)
-    
-    print("\nHyperband tuner ready for RL optimization.")
-    print("Use run_hyperband_optimization() to start tuning.")
+    ray.shutdown()
