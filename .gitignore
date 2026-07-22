@@ -3,36 +3,26 @@
 *.pyc
 __pycache__/
 
-# Rust build artifacts
-target/
-**/*.rs.bk
-
 # Dependencies
-.venv/
 venv/
-node_modules/
-
-# Logs and temporary files
-*.log
-*.tmp
-*.swp
-
-# Environment files
+.venv/
 .env
 .env.local
 *.env.*
+
+# Build artifacts
+target/
+build/
+dist/
+
+# Logs
+*.log
 
 # Editors
 .vscode/
 .idea/
 
-# Coverage reports
-coverage/
-htmlcov/
-.coverage
-
-# MyPy cache
-.mypy_cache/
-# PyTest cache
-.pytest_cache/
+# OS
+.DS_Store
+Thumbs.db
 ```
