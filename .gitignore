@@ -5,7 +5,7 @@ __pycache__/
 
 # Rust build artifacts
 target/
-**/*.rs.bk
+Cargo.lock
 
 # Dependencies
 .venv/
@@ -15,24 +15,26 @@ node_modules/
 # Logs and temporary files
 *.log
 *.tmp
-*.swp
+
+# Editors
+.vscode/
+.idea/
 
 # Environment files
 .env
 .env.local
 *.env.*
 
-# Editors
-.vscode/
-.idea/
-
 # Coverage reports
 coverage/
 htmlcov/
 .coverage
 
-# MyPy cache
+# Python cache
 .mypy_cache/
-# PyTest cache
 .pytest_cache/
+
+# Build directories
+build/
+dist/
 ```
