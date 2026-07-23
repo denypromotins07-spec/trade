@@ -1,0 +1,348 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Nautilus/Ray Global Styles
+ * 
+ * Optimized for:
+ * - GPU-accelerated rendering via will-change and transform properties
+ * - Custom scrollbar styling for dense data views
+ * - CSS variables for dynamic theming
+ * - Hardware-accelerated Framer Motion keyframes
+ */
+
+/* ==========================================================================
+   CSS Custom Properties (Variables)
+   ========================================================================== */
+
+:root {
+  /* Background colors - deep obsidian palette */
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #0d0d14;
+  --bg-tertiary: #12121a;
+  --bg-card: rgba(18, 18, 26, 0.7);
+  --bg-glass: rgba(10, 10, 15, 0.6);
+  
+  /* Neon accent colors */
+  --neon-cyan: #00f5ff;
+  --neon-magenta: #ff00ff;
+  --neon-green: #00ff88;
+  --neon-red: #ff3366;
+  --neon-amber: #ffaa00;
+  
+  /* Trading colors */
+  --trading-long: #00ff88;
+  --trading-short: #ff3366;
+  --trading-neutral: #6b7280;
+  
+  /* Glassmorphism values */
+  --glass-blur: 12px;
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  
+  /* Typography */
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-display: 'Rajdhani', system-ui, sans-serif;
+  
+  /* Transitions - GPU accelerated */
+  --transition-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-snap: cubic-bezier(0.68, -0.55, 0.265, 1.55);
+  
+  /* Z-index layers */
+  --z-sidebar: 100;
+  --z-topbar: 200;
+  --z-modal: 300;
+  --z-tooltip: 400;
+}
+
+/* ==========================================================================
+   Base Styles
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background-color: var(--bg-primary);
+  color: #e5e5e5;
+  overflow: hidden; /* Prevent body scroll, app handles scrolling */
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-sans);
+  background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+  min-height: 100vh;
+  min-width: 100vw;
+  overflow: hidden;
+}
+
+/* ==========================================================================
+   Custom Scrollbar - Dense Data View Optimized
+   ========================================================================== */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(
+    180deg,
+    var(--neon-cyan) 0%,
+    var(--neon-magenta) 100%
+  );
+  border-radius: 3px;
+  transition: background 0.2s var(--transition-smooth);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(
+    180deg,
+    var(--neon-green) 0%,
+    var(--neon-cyan) 100%
+  );
+}
+
+::-webkit-scrollbar-corner {
+  background: var(--bg-tertiary);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--neon-cyan) var(--bg-tertiary);
+}
+
+/* ==========================================================================
+   Selection Styling
+   ========================================================================== */
+
+::selection {
+  background-color: var(--neon-cyan);
+  color: var(--bg-primary);
+}
+
+::-moz-selection {
+  background-color: var(--neon-cyan);
+  color: var(--bg-primary);
+}
+
+/* ==========================================================================
+   Utility Classes - Glassmorphism
+   ========================================================================== */
+
+.glass-panel {
+  background: var(--bg-glass);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  will-change: transform, opacity;
+  transform: translateZ(0); /* Force GPU layer */
+}
+
+.glass-panel-strong {
+  background: rgba(18, 18, 26, 0.9);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+.glass-panel-light {
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  will-change: transform, opacity;
+  transform: translateZ(0);
+}
+
+/* ==========================================================================
+   Utility Classes - Neon Glow Effects
+   ========================================================================== */
+
+.neon-text-cyan {
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 245, 255, 0.5),
+               0 0 20px rgba(0, 245, 255, 0.3);
+}
+
+.neon-text-magenta {
+  color: var(--neon-magenta);
+  text-shadow: 0 0 10px rgba(255, 0, 255, 0.5),
+               0 0 20px rgba(255, 0, 255, 0.3);
+}
+
+.neon-text-green {
+  color: var(--neon-green);
+  text-shadow: 0 0 10px rgba(0, 255, 136, 0.5),
+               0 0 20px rgba(0, 255, 136, 0.3);
+}
+
+.neon-text-red {
+  color: var(--neon-red);
+  text-shadow: 0 0 10px rgba(255, 51, 102, 0.5),
+               0 0 20px rgba(255, 51, 102, 0.3);
+}
+
+.neon-border-cyan {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 10px rgba(0, 245, 255, 0.3),
+              inset 0 0 10px rgba(0, 245, 255, 0.05);
+}
+
+/* ==========================================================================
+   GPU-Accelerated Animations
+   ========================================================================== */
+
+@keyframes scan-line {
+  0% {
+    transform: translateY(-100%) translateZ(0);
+  }
+  100% {
+    transform: translateY(100vh) translateZ(0);
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px rgba(0, 245, 255, 0.6));
+  }
+  50% {
+    opacity: 0.8;
+    filter: drop-shadow(0 0 16px rgba(0, 245, 255, 0.3));
+  }
+}
+
+@keyframes latency-ping {
+  0% {
+    transform: scale(0.8) translateZ(0);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(2) translateZ(0);
+    opacity: 0;
+  }
+}
+
+@keyframes hologram-flicker {
+  0%, 100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.85;
+  }
+  52% {
+    opacity: 0.9;
+  }
+  54% {
+    opacity: 0.88;
+  }
+}
+
+.scan-line-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(0, 245, 255, 0.03) 50%,
+    transparent 100%
+  );
+  animation: scan-line 8s linear infinite;
+  pointer-events: none;
+  z-index: 9999;
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+/* ==========================================================================
+   Performance Optimizations
+   ========================================================================== */
+
+/* Force GPU compositing for animated elements */
+.will-animate {
+  will-change: transform, opacity;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* Disable pointer events on decorative elements */
+.pointer-none {
+  pointer-events: none;
+}
+
+/* Text rendering optimization for numbers */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* Prevent layout shift during animations */
+.fixed-dimensions {
+  contain: layout paint;
+}
+
+/* ==========================================================================
+   Focus States - Accessibility
+   ========================================================================== */
+
+:focus-visible {
+  outline: 2px solid var(--neon-cyan);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ==========================================================================
+   Print Styles
+   ========================================================================== */
+
+@media print {
+  .no-print,
+  .sidebar,
+  .topbar {
+    display: none !important;
+  }
+  
+  body {
+    background: white;
+    color: black;
+  }
+}
+
+/* ==========================================================================
+   Reduced Motion - Accessibility
+   ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
