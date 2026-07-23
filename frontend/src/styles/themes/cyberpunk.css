@@ -1,0 +1,217 @@
+/**
+ * File 10: frontend/src/styles/themes/cyberpunk.css
+ * 
+ * Elite Implementation:
+ * - Primary deep obsidian and neon cyan CSS variables.
+ * - Custom glassmorphism backdrop filters.
+ * - Hardware-accelerated shadow glows.
+ * - Optimized for 60FPS with will-change hints.
+ */
+
+:root {
+  /* Core Colors - Deep Obsidian Base */
+  --cyber-obsidian-50: #f0f9ff;
+  --cyber-obsidian-100: #e0f2fe;
+  --cyber-obsidian-200: #bae6fd;
+  --cyber-obsidian-300: #7dd3fc;
+  --cyber-obsidian-400: #38bdf8;
+  --cyber-obsidian-500: #0ea5e9;
+  --cyber-obsidian-600: #0284c7;
+  --cyber-obsidian-700: #0369a1;
+  --cyber-obsidian-800: #075985;
+  --cyber-obsidian-900: #0c4a6e;
+  --cyber-obsidian-950: #082f49;
+
+  /* Neon Accent Colors */
+  --neon-cyan: #00ffff;
+  --neon-cyan-dim: rgba(0, 255, 255, 0.7);
+  --neon-cyan-glow: rgba(0, 255, 255, 0.5);
+  
+  --neon-magenta: #ff00ff;
+  --neon-magenta-dim: rgba(255, 0, 255, 0.7);
+  --neon-magenta-glow: rgba(255, 0, 255, 0.5);
+  
+  --neon-green: #00ff88;
+  --neon-green-dim: rgba(0, 255, 136, 0.7);
+  --neon-green-glow: rgba(0, 255, 136, 0.5);
+  
+  --neon-red: #ff0055;
+  --neon-red-dim: rgba(255, 0, 85, 0.7);
+  --neon-red-glow: rgba(255, 0, 85, 0.5);
+  
+  --neon-yellow: #ffaa00;
+  --neon-yellow-dim: rgba(255, 170, 0, 0.7);
+  --neon-yellow-glow: rgba(255, 170, 0, 0.5);
+
+  /* Background Layers */
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #12121a;
+  --bg-tertiary: #1a1a25;
+  --bg-elevated: #222230;
+  --bg-overlay: rgba(10, 10, 15, 0.8);
+
+  /* Panel Styling */
+  --panel-bg: rgba(18, 18, 26, 0.6);
+  --panel-border: rgba(0, 255, 255, 0.15);
+  --panel-border-hover: rgba(0, 255, 255, 0.4);
+  --panel-radius: 8px;
+
+  /* Glassmorphism */
+  --glass-bg: rgba(255, 255, 255, 0.03);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur: 20px;
+  --glass-saturate: 180%;
+
+  /* Typography */
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  
+  --text-primary: #ffffff;
+  --text-secondary: #a0a0b0;
+  --text-tertiary: #606070;
+  --text-neon: var(--neon-cyan);
+
+  /* Shadows & Glows - Hardware Accelerated */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 15px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 20px 25px rgba(0, 0, 0, 0.6);
+  
+  --glow-cyan-sm: 0 0 10px var(--neon-cyan-glow);
+  --glow-cyan-md: 0 0 20px var(--neon-cyan-glow), 0 0 40px var(--neon-cyan-glow);
+  --glow-cyan-lg: 0 0 30px var(--neon-cyan-glow), 0 0 60px var(--neon-cyan-glow), 0 0 80px var(--neon-cyan-glow);
+  
+  --glow-red-sm: 0 0 10px var(--neon-red-glow);
+  --glow-red-md: 0 0 20px var(--neon-red-glow), 0 0 40px var(--neon-red-glow);
+  --glow-red-lg: 0 0 30px var(--neon-red-glow), 0 0 60px var(--neon-red-glow), 0 0 80px var(--neon-red-glow);
+
+  /* Grid & Layout */
+  --grid-cell-size: 40px;
+  --grid-line-color: rgba(0, 255, 255, 0.03);
+
+  /* Animations */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 250ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow: 400ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-bounce: 500ms cubic-bezier(0.68, -0.55, 0.265, 1.55);
+
+  /* Scanline Effect */
+  --scanline-color: rgba(0, 255, 255, 0.02);
+  --scanline-size: 4px;
+}
+
+/* Cyberpunk Theme Class */
+.theme-cyberpunk {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+/* Glassmorphism Utility Classes */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+}
+
+.glass-panel-strong {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(30px) saturate(200%);
+  -webkit-backdrop-filter: blur(30px) saturate(200%);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+/* Neon Glow Effects */
+.neon-text-cyan {
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px var(--neon-cyan-glow), 0 0 20px var(--neon-cyan-glow);
+}
+
+.neon-text-magenta {
+  color: var(--neon-magenta);
+  text-shadow: 0 0 10px var(--neon-magenta-glow), 0 0 20px var(--neon-magenta-glow);
+}
+
+.neon-text-green {
+  color: var(--neon-green);
+  text-shadow: 0 0 10px var(--neon-green-glow), 0 0 20px var(--neon-green-glow);
+}
+
+.neon-text-red {
+  color: var(--neon-red);
+  text-shadow: 0 0 10px var(--neon-red-glow), 0 0 20px var(--neon-red-glow);
+}
+
+/* Border Glow Effects */
+.border-glow-cyan {
+  border-color: var(--neon-cyan-dim);
+  box-shadow: var(--glow-cyan-sm);
+  transition: box-shadow var(--transition-base);
+}
+
+.border-glow-cyan:hover {
+  box-shadow: var(--glow-cyan-md);
+}
+
+/* Hardware Acceleration Hints */
+.gpu-accelerated {
+  transform: translateZ(0);
+  will-change: transform;
+}
+
+/* Scanline Overlay */
+.scanlines::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    var(--scanline-color) 2px,
+    var(--scanline-color) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* Custom Scrollbar */
+.scrollbar-cyber {
+  scrollbar-width: thin;
+  scrollbar-color: var(--neon-cyan-dim) var(--bg-secondary);
+}
+
+.scrollbar-cyber::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.scrollbar-cyber::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+  border: 1px solid var(--panel-border);
+}
+
+.scrollbar-cyber::-webkit-scrollbar-thumb {
+  background: var(--neon-cyan-dim);
+  border-radius: 4px;
+  box-shadow: 0 0 10px var(--neon-cyan-glow);
+}
+
+.scrollbar-cyber::-webkit-scrollbar-thumb:hover {
+  background: var(--neon-cyan);
+  box-shadow: 0 0 20px var(--neon-cyan-glow);
+}
+
+/* Selection Color */
+::selection {
+  background: var(--neon-cyan-dim);
+  color: var(--bg-primary);
+}
+
+/* Focus Ring */
+.focus-cyber:focus-visible {
+  outline: 2px solid var(--neon-cyan);
+  outline-offset: 2px;
+  box-shadow: var(--glow-cyan-sm);
+}
