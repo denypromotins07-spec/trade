@@ -1,0 +1,366 @@
+/* ============================================================================
+   GLOBAL STYLES - CYBERPUNK/QUANTITATIVE THEME
+   GPU-accelerated animations, custom scrollbars, CSS variables
+   Optimized for hardware acceleration and minimal repaints
+   ========================================================================== */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   CSS CUSTOM PROPERTIES (VARIABLES)
+   Centralized theming for consistent cyberpunk aesthetic
+   ========================================================================== */
+
+:root {
+  /* Color palette */
+  --color-obsidian-50: #0a0a0f;
+  --color-obsidian-100: #0d0d14;
+  --color-obsidian-200: #12121a;
+  --color-obsidian-300: #1a1a25;
+  --color-obsidian-400: #222230;
+  --color-obsidian-500: #2a2a3c;
+  
+  /* Neon accents */
+  --color-neon-cyan: #00f3ff;
+  --color-neon-magenta: #ff00ff;
+  --color-neon-lime: #ccff00;
+  --color-neon-amber: #ffaa00;
+  
+  /* Status colors */
+  --color-status-success: #00ff9d;
+  --color-status-warning: #ffaa00;
+  --color-status-error: #ff2a6d;
+  --color-status-info: #00f3ff;
+  
+  /* Glass overlays */
+  --glass-light: rgba(255, 255, 255, 0.03);
+  --glass-medium: rgba(255, 255, 255, 0.05);
+  --glass-heavy: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  
+  /* Glow effects */
+  --glow-cyan: 0 0 10px rgba(0, 243, 255, 0.5), 0 0 20px rgba(0, 243, 255, 0.3);
+  --glow-magenta: 0 0 10px rgba(255, 0, 255, 0.5), 0 0 20px rgba(255, 0, 255, 0.3);
+  --glow-lime: 0 0 10px rgba(204, 255, 0, 0.5), 0 0 20px rgba(204, 255, 0, 0.3);
+  
+  /* Animation timing */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-normal: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow: 500ms cubic-bezier(0.4, 0, 0.2, 1);
+  
+  /* Z-index layers */
+  --z-base: 0;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-fixed: 300;
+  --z-modal-backdrop: 400;
+  --z-modal: 500;
+  --z-popover: 600;
+  --z-tooltip: 700;
+}
+
+/* ============================================================================
+   BASE STYLES
+   Reset and foundational styles for dark cyberpunk theme
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background-color: var(--color-obsidian-50);
+  color: #e5e5e5;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  background: linear-gradient(135deg, var(--color-obsidian-50) 0%, var(--color-obsidian-200) 50%, var(--color-obsidian-100) 100%);
+  overflow-x: hidden;
+}
+
+/* ============================================================================
+   SCROLLBAR STYLING - Cyberpunk Theme
+   Custom scrollbars with neon accents
+   ========================================================================== */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-obsidian-200);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--color-neon-cyan) 0%, var(--color-neon-magenta) 100%);
+  border-radius: 4px;
+  transition: background var(--transition-fast);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--color-neon-magenta) 0%, var(--color-neon-cyan) 100%);
+}
+
+::-webkit-scrollbar-corner {
+  background: var(--color-obsidian-200);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-neon-cyan) var(--color-obsidian-200);
+}
+
+/* ============================================================================
+   SELECTION STYLING
+   Custom text selection with neon colors
+   ========================================================================== */
+
+::selection {
+  background-color: var(--color-neon-cyan);
+  color: var(--color-obsidian-50);
+}
+
+::-moz-selection {
+  background-color: var(--color-neon-cyan);
+  color: var(--color-obsidian-50);
+}
+
+/* ============================================================================
+   GLASSMORPHISM UTILITY CLASSES
+   Hardware-accelerated glass effects using backdrop-filter
+   ========================================================================== */
+
+.glass-card {
+  background: var(--glass-medium);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  box-shadow: 
+    var(--glass-inner),
+    0 4px 30px rgba(0, 0, 0, 0.3);
+  will-change: transform, opacity;
+  transform: translateZ(0); /* Force GPU layer */
+}
+
+.glass-card-light {
+  background: var(--glass-light);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.glass-card-heavy {
+  background: var(--glass-heavy);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  box-shadow: 
+    var(--glass-inner),
+    0 8px 32px rgba(0, 0, 0, 0.4),
+    var(--glow-soft);
+}
+
+/* ============================================================================
+   NEON GLOW EFFECTS
+   GPU-accelerated glow animations
+   ========================================================================== */
+
+.neon-glow-cyan {
+  box-shadow: var(--glow-cyan);
+  animation: glow-pulse-cyan 2s ease-in-out infinite;
+}
+
+.neon-glow-magenta {
+  box-shadow: var(--glow-magenta);
+  animation: glow-pulse-magenta 2s ease-in-out infinite;
+}
+
+@keyframes glow-pulse-cyan {
+  0%, 100% {
+    box-shadow: 0 0 5px rgba(0, 243, 255, 0.3), 0 0 10px rgba(0, 243, 255, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 15px rgba(0, 243, 255, 0.6), 0 0 30px rgba(0, 243, 255, 0.4);
+  }
+}
+
+@keyframes glow-pulse-magenta {
+  0%, 100% {
+    box-shadow: 0 0 5px rgba(255, 0, 255, 0.3), 0 0 10px rgba(255, 0, 255, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 15px rgba(255, 0, 255, 0.6), 0 0 30px rgba(255, 0, 255, 0.4);
+  }
+}
+
+/* ============================================================================
+   HARDWARE ACCELERATION UTILITIES
+   Force GPU compositing for smooth animations
+   ========================================================================== */
+
+.gpu-accelerated {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  perspective: 1000px;
+  will-change: transform, opacity;
+}
+
+.no-repaint {
+  contain: paint layout;
+  isolation: isolate;
+}
+
+/* ============================================================================
+   TEXT GRADIENTS
+   Cyberpunk text styling
+   ========================================================================== */
+
+.text-gradient {
+  background: linear-gradient(90deg, var(--color-neon-cyan) 0%, var(--color-neon-magenta) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.text-gradient-lime {
+  background: linear-gradient(90deg, var(--color-neon-lime) 0%, var(--color-neon-cyan) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ============================================================================
+   FOCUS STATES
+   Accessible focus rings with neon styling
+   ========================================================================== */
+
+:focus-visible {
+  outline: 2px solid var(--color-neon-cyan);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(0, 243, 255, 0.2);
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--color-neon-cyan);
+  outline-offset: 2px;
+  box-shadow: 
+    0 0 0 4px rgba(0, 243, 255, 0.2),
+    var(--glow-cyan);
+}
+
+/* ============================================================================
+   ANIMATION UTILITIES
+   Pre-defined animations for common UI patterns
+   ========================================================================== */
+
+.animate-slide-up {
+  animation: slideUp 0.3s ease-out forwards;
+}
+
+.animate-slide-down {
+  animation: slideDown 0.3s ease-out forwards;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out forwards;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ============================================================================
+   SCAN LINE OVERLAY (Optional retro effect)
+   ========================================================================== */
+
+.scan-line-overlay::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    to bottom,
+    transparent 50%,
+    rgba(0, 0, 0, 0.1) 51%
+  );
+  background-size: 100% 4px;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ============================================================================
+   MONOSPACE DATA DISPLAY
+   Optimized for numerical data rendering
+   ========================================================================== */
+
+.mono-data {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-feature-settings: 'tnum' on, 'lnum' on;
+  letter-spacing: -0.02em;
+}
+
+/* ============================================================================
+   RESPONSIVE UTILITIES
+   Mobile-first breakpoints
+   ========================================================================== */
+
+@media (max-width: 640px) {
+  html {
+    font-size: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
