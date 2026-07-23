@@ -1,42 +1,42 @@
 ```
-# Compiled Python files
+# Compiled and build artifacts
 *.pyc
 __pycache__/
-
-# Rust build artifacts
-target/
-**/*.rs.bk
-
-# Logs
-*.log
-
-# Environment files
-.env
-.env.local
-*.env.*
-
-# Editor/IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-*.tmp
-
+*.o
+*.obj
+*.class
+*.exe
+*.dll
+*.so
+*.a
+*.out
 # Dependencies
 .venv/
 venv/
 node_modules/
-
-# Coverage reports
+.mypy_cache/
+.pytest_cache/
+target/
+.gradle/
+build/
+dist/
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+# Environment
+.env
+.env.local
+*.env.*
+# Editors
+.vscode/
+.idea/
+# Coverage
 coverage/
 htmlcov/
 .coverage
-
-# Distribution artifacts
-dist/
-build/
-
-# Cache directories
-.mypy_cache/
-.pytest_cache/
+# System files
+.DS_Store
+Thumbs.db
 ```
