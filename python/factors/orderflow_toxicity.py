@@ -1,512 +1,374 @@
 """
-Orderflow Toxicity Factor - VPIN and Cross-Sectional Aggregation
+python/factors/orderflow_toxicity.py
 
-Aggregates VPIN (Volume-Synchronized Probability of Informed Trading) and toxicity
-scores cross-sectionally to identify which specific altcoins are currently experiencing
-the highest informed trading pressure.
+Cross-Sectional Order Flow Toxicity Aggregator
 
-Uses Ray for distributed processing with strict 4GB RAM quota enforcement.
+Aggregates VPIN (Volume-Synchronized Probability of Informed Trading) and toxicity scores
+cross-sectionally to identify which specific altcoins are experiencing the highest informed
+trading pressure. Uses streaming mini-batches to enforce 4GB Python RAM quota.
+
+Memory Constraint: Processes order flow in streaming batches with Polars vectorization.
+Handles missing data and exchange halts gracefully.
 """
 
 import ray
 import polars as pl
 import numpy as np
-from typing import List, Dict, Optional, Tuple
+from typing import Optional, List, Dict, Generator, Tuple
 from dataclasses import dataclass
 import os
-import gc
-from collections import defaultdict
+import torch
 
 
-def init_ray_strict_memory():
-    """Initialize Ray with strict 4GB memory limit."""
-    if not ray.is_initialized():
-        rocm_available = os.environ.get('ROCM_PATH') is not None
-        
-        ray.init(
-            _memory=int(4.0 * 1024 * 1024 * 1024),
-            _object_store_memory=int(1.5 * 1024 * 1024 * 1024),
-            num_cpus=min(os.cpu_count() or 4, 8),
-        )
-        
-        return {'rocm_available': rocm_available}
+def check_amd_acceleration() -> Dict[str, bool]:
+    """Detect AMD ROCm/DirectML availability for PyTorch acceleration."""
+    result = {
+        "cuda": torch.cuda.is_available(),
+        "rocm": False,
+        "directml": False,
+        "cpu": True,
+    }
     
-    return {'rocm_available': False}
+    if hasattr(torch.backends, 'hip') and torch.backends.hip.is_available():
+        result["rocm"] = True
+    
+    rocm_path = os.environ.get("ROCM_PATH", "")
+    if rocm_path and os.path.exists(rocm_path):
+        result["rocm"] = True
+    
+    if os.name == 'nt':
+        try:
+            import torch_directml
+            result["directml"] = True
+        except ImportError:
+            pass
+    
+    return result
 
 
 @dataclass
 class ToxicityConfig:
-    """Configuration for orderflow toxicity calculation."""
-    # Number of volume buckets for VPIN calculation
-    n_buckets: int = 50
+    """Configuration for order flow toxicity calculation."""
+    bucket_size: int = 1000  # Number of trades per VPIN bucket
+    num_buckets: int = 50    # Number of buckets for VPIN calculation
+    lookback_windows: List[int] = None  # Windows for multi-scale toxicity
+    max_universe_size: int = 500
+    min_liquidity_usd: float = 1_000_000
+    ram_limit_bytes: int = 4 * 1024 * 1024 * 1024  # 4GB
     
-    # Bucket size in base currency units
-    bucket_size: float = 100.0
-    
-    # Lookback window for EPCP (Expected Price Change)
-    epcp_window: int = 30
-    
-    # Minimum trades for valid calculation
-    min_trades: int = 10
-    
-    # Theta threshold for toxicity classification
-    theta_toxic: float = 0.7
+    def __post_init__(self):
+        if self.lookback_windows is None:
+            self.lookback_windows = [5, 15, 60]  # minutes
 
 
-@ray.remote(max_calls=50)
-class OrderflowToxicityWorker:
+@ray.remote(max_calls=100)
+class OrderFlowToxicityWorker:
     """
-    Ray worker for computing VPIN and orderflow toxicity scores.
-    
-    Implements the Easley, López de Prado, and O'Hara (2012) VPIN methodology
-    adapted for crypto markets.
+    Ray worker for computing VPIN and order flow toxicity scores.
+    Uses streaming mini-batches to stay within 4GB RAM quota.
     """
     
     def __init__(self, config: ToxicityConfig):
         self.config = config
-        self._max_memory_bytes = int(4.0 * 1024 * 1024 * 1024)
-        self._processed_assets = 0
+        self.acceleration = check_amd_acceleration()
+        self._trade_buffer = {}  # Per-symbol buffers
+        self._total_trades = 0
+        self._max_total_trades = 100000
         
-    def classify_trade_sign(
+    def process_trade_batch(
         self,
-        prices: np.ndarray,
-        volumes: np.ndarray
-    ) -> np.ndarray:
+        trade_batch: pl.DataFrame,
+        is_final: bool = False
+    ) -> Optional[pl.DataFrame]:
         """
-        Classify trades as buy/sell using tick rule and bulk volume classification.
+        Process streaming mini-batch of trade data for VPIN calculation.
         
-        Returns: array of trade signs (+1 for buyer-initiated, -1 for seller-initiated)
-        """
-        if len(prices) < 2:
-            return np.zeros(len(prices))
-        
-        # Tick rule: compare price to previous price
-        price_diff = np.diff(prices)
-        trade_signs = np.sign(price_diff)
-        
-        # Handle zero changes (same price) - use previous sign or default to 0
-        for i in range(len(trade_signs)):
-            if trade_signs[i] == 0:
-                # Look back for last non-zero sign
-                for j in range(i - 1, -1, -1):
-                    if trade_signs[j] != 0:
-                        trade_signs[i] = trade_signs[j]
-                        break
-                else:
-                    trade_signs[i] = 0  # Default if all previous are zero
-        
-        # Prepend 0 for first trade (no previous price)
-        trade_signs = np.concatenate([[0], trade_signs])
-        
-        return trade_signs
-    
-    def compute_vpin(
-        self,
-        prices: np.ndarray,
-        volumes: np.ndarray,
-        trade_signs: Optional[np.ndarray] = None
-    ) -> Tuple[float, List[float]]:
-        """
-        Compute VPIN (Volume-Synchronized Probability of Informed Trading).
-        
-        VPIN measures the imbalance between buy and sell volume, which indicates
-        the presence of informed traders.
-        
+        Args:
+            trade_batch: Polars DataFrame with [symbol, timestamp, price, volume, side]
+                         side: +1 for buy, -1 for sell
+            is_final: If True, flush remaining buffered data
+            
         Returns:
-            - Current VPIN value
-            - Time series of VPIN values
+            Toxicity scores including VPIN, or None if buffering
         """
-        if len(prices) < self.config.min_trades:
-            return np.nan, [np.nan]
+        import psutil
+        process = psutil.Process()
+        current_ram = process.memory_info().rss
         
-        if trade_signs is None:
-            trade_signs = self.classify_trade_sign(prices, volumes)
+        if current_ram > self.config.ram_limit_bytes * 0.9:
+            self._flush_buffers()
         
-        # Volume bucketing
-        bucket_size = self.config.bucket_size
-        n_buckets = self.config.n_buckets
+        # Add to per-symbol buffers
+        for symbol in trade_batch["symbol"].unique():
+            symbol_data = trade_batch.filter(pl.col("symbol") == symbol)
+            if symbol not in self._trade_buffer:
+                self._trade_buffer[symbol] = []
+            self._trade_buffer[symbol].append(symbol_data)
         
-        vpin_values = []
-        current_bucket_buy = 0.0
-        current_bucket_sell = 0.0
-        bucket_count = 0
+        self._total_trades += len(trade_batch)
         
-        for i in range(len(volumes)):
-            volume = volumes[i]
-            sign = trade_signs[i] if i < len(trade_signs) else 0
-            
-            if sign > 0:
-                current_bucket_buy += volume
-            elif sign < 0:
-                current_bucket_sell += volume
-            
-            # Check if bucket is full
-            total_bucket_volume = current_bucket_buy + current_bucket_sell
-            
-            if total_bucket_volume >= bucket_size and bucket_count < n_buckets:
-                # Calculate imbalance for this bucket
-                imbalance = abs(current_bucket_buy - current_bucket_sell)
-                vpin_bucket = imbalance / total_bucket_volume if total_bucket_volume > 0 else 0
-                vpin_values.append(vpin_bucket)
-                
-                # Reset bucket
-                current_bucket_buy = 0.0
-                current_bucket_sell = 0.0
-                bucket_count += 1
+        if not is_final and self._total_trades < self._max_total_trades:
+            return None
         
-        # Handle partial final bucket
-        if current_bucket_buy + current_bucket_sell > 0 and bucket_count < n_buckets:
-            imbalance = abs(current_bucket_buy - current_bucket_sell)
-            total = current_bucket_buy + current_bucket_sell
-            vpin_values.append(imbalance / total if total > 0 else 0)
-        
-        if len(vpin_values) == 0:
-            return np.nan, [np.nan]
-        
-        # Current VPIN is the average of recent buckets
-        recent_buckets = min(10, len(vpin_values))
-        current_vpin = np.mean(vpin_values[-recent_buckets:])
-        
-        return current_vpin, vpin_values
+        return self._compute_toxicity_scores()
     
-    def compute_epcp(self, prices: np.ndarray, volumes: np.ndarray) -> float:
-        """
-        Compute Expected Price Change (EPCP) component of toxicity.
-        
-        Measures the expected absolute price change given order flow.
-        """
-        if len(prices) < self.config.epcp_window + 1:
-            return np.nan
-        
-        # Calculate returns
-        returns = np.diff(np.log(prices))
-        
-        # Rolling expected absolute return
-        window = min(self.config.epcp_window, len(returns))
-        abs_returns = np.abs(returns)
-        
-        # EWMA of absolute returns
-        if len(abs_returns) > 0:
-            epcp = np.mean(abs_returns[-window:])
-        else:
-            epcp = 0.0
-        
-        return epcp
+    def _flush_buffers(self) -> None:
+        """Clear all buffers."""
+        self._trade_buffer = {}
+        self._total_trades = 0
     
-    def compute_toxicity_score(
-        self,
-        symbol: str,
-        price_data: Dict[str, List[float]],
-        volume_data: Dict[str, List[float]]
-    ) -> Dict:
+    def _compute_toxicity_scores(self) -> Optional[pl.DataFrame]:
         """
-        Compute comprehensive toxicity score for a single asset.
+        Compute VPIN and cross-sectional toxicity scores.
         
-        Combines VPIN, EPCP, and other metrics into a unified toxicity score.
+        VPIN Formula:
+        VPIN = (1/n) * sum(|V_buy - V_sell|) / (V_buy + V_sell)
+        
+        Higher VPIN indicates more informed trading (toxicity).
         """
-        prices = np.array(price_data.get('prices', []))
-        volumes = np.array(volume_data.get('volumes', []))
+        if not self._trade_buffer:
+            return None
         
-        if len(prices) < self.config.min_trades or len(volumes) < self.config.min_trades:
-            return {
-                'symbol': symbol,
-                'vpin': np.nan,
-                'epcp': np.nan,
-                'toxicity_score': np.nan,
-                'is_toxic': False,
-                'valid': False,
-            }
-        
-        # Ensure same length
-        min_len = min(len(prices), len(volumes))
-        prices = prices[:min_len]
-        volumes = volumes[:min_len]
-        
-        try:
-            # Compute VPIN
-            vpin, vpin_series = self.compute_vpin(prices, volumes)
-            
-            # Compute EPCP
-            epcp = self.compute_epcp(prices, volumes)
-            
-            # Compute additional toxicity metrics
-            # Volume concentration (Herfindahl-like index)
-            vol_concentration = np.sum((volumes / np.sum(volumes)) ** 2) if np.sum(volumes) > 0 else 0
-            
-            # Price impact coefficient (rough estimate)
-            returns = np.diff(np.log(prices)) if len(prices) > 1 else np.array([0])
-            signed_volume = volumes[:-1] * np.sign(np.diff(prices)) if len(prices) > 1 else np.array([0])
-            
-            if len(signed_volume) > 1 and np.var(signed_volume) > 0:
-                price_impact = np.corrcoef(returns, signed_volume)[0, 1]
-            else:
-                price_impact = 0.0
-            
-            # Composite toxicity score
-            # Weight: VPIN=0.5, EPCP=0.2, Vol Concentration=0.15, Price Impact=0.15
-            toxicity_components = []
-            weights = []
-            
-            if not np.isnan(vpin):
-                toxicity_components.append(vpin)
-                weights.append(0.5)
-            
-            if not np.isnan(epcp):
-                # Normalize EPCP (typical crypto daily vol ~2-5%)
-                normalized_epcp = min(epcp * 100, 1.0)
-                toxicity_components.append(normalized_epcp)
-                weights.append(0.2)
-            
-            toxicity_components.append(vol_concentration * 10)  # Scale up
-            weights.append(0.15)
-            
-            toxicity_components.append(abs(price_impact))
-            weights.append(0.15)
-            
-            # Weighted average
-            if len(toxicity_components) > 0:
-                toxicity_score = sum(c * w for c, w in zip(toxicity_components, weights))
-                toxicity_score = min(toxicity_score, 1.0)  # Cap at 1.0
-            else:
-                toxicity_score = np.nan
-            
-            is_toxic = toxicity_score > self.config.theta_toxic if not np.isnan(toxicity_score) else False
-            
-            self._processed_assets += 1
-            
-            return {
-                'symbol': symbol,
-                'vpin': float(vpin) if not np.isnan(vpin) else np.nan,
-                'epcp': float(epcp) if not np.isnan(epcp) else np.nan,
-                'vol_concentration': float(vol_concentration),
-                'price_impact': float(price_impact) if not np.isnan(price_impact) else np.nan,
-                'toxicity_score': float(toxicity_score) if not np.isnan(toxicity_score) else np.nan,
-                'is_toxic': is_toxic,
-                'valid': True,
-            }
-            
-        except Exception as e:
-            return {
-                'symbol': symbol,
-                'vpin': np.nan,
-                'epcp': np.nan,
-                'toxicity_score': np.nan,
-                'is_toxic': False,
-                'valid': False,
-                'error': str(e),
-            }
-    
-    def process_batch(
-        self,
-        symbols: List[str],
-        all_price_data: Dict[str, Dict[str, List[float]]],
-        all_volume_data: Dict[str, Dict[str, List[float]]]
-    ) -> List[Dict]:
-        """Process batch of symbols with memory enforcement."""
         results = []
         
-        for symbol in symbols:
-            if symbol not in all_price_data or symbol not in all_volume_data:
+        for symbol, batches in self._trade_buffer.items():
+            if not batches:
                 continue
             
-            try:
-                result = self.compute_toxicity_score(
-                    symbol,
-                    all_price_data[symbol],
-                    all_volume_data[symbol]
-                )
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    'symbol': symbol,
-                    'vpin': np.nan,
-                    'toxicity_score': np.nan,
-                    'is_toxic': False,
-                    'valid': False,
-                    'error': str(e),
-                })
+            # Concatenate all batches for this symbol
+            trades = pl.concat(batches, how="vertical")
             
-            # Memory pressure check
-            if self._processed_assets % 10 == 0:
-                gc.collect()
+            # Handle missing data
+            trades = trades.sort("timestamp").fill_null(strategy="forward_fill")
+            
+            # Calculate VPIN using volume buckets
+            vpin_result = self._calculate_vpin(trades, symbol)
+            if vpin_result is not None:
+                results.append(vpin_result)
         
-        return results
+        if not results:
+            return None
+        
+        # Combine into single DataFrame
+        combined = pl.concat(results, how="vertical")
+        
+        # Cross-sectional ranking
+        for window in self.config.lookback_windows:
+            col = f"vpin_{window}m"
+            if col in combined.columns:
+                rank_col = f"toxicity_rank_{window}m"
+                combined = combined.with_columns([
+                    ((pl.col(col) - pl.col(col).mean()) /
+                     (pl.col(col).std() + 1e-8)).alias(rank_col)
+                ])
+        
+        # Filter by liquidity
+        if "volume_usd" in combined.columns:
+            combined = combined.filter(
+                pl.col("volume_usd") >= self.config.min_liquidity_usd
+            )
+        
+        # Limit universe size and sort by toxicity
+        if "toxicity_rank_60m" in combined.columns:
+            combined = combined.sort("toxicity_rank_60m", reverse=True)
+            combined = combined.head(self.config.max_universe_size)
+        
+        return combined
     
-    def get_stats(self) -> Dict:
-        return {
-            'processed_assets': self._processed_assets,
-            'max_memory_bytes': self._max_memory_bytes,
-        }
+    def _calculate_vpin(
+        self, 
+        trades: pl.DataFrame, 
+        symbol: str
+    ) -> Optional[pl.DataFrame]:
+        """
+        Calculate VPIN for a single symbol using volume bucketing.
+        """
+        if len(trades) < self.config.bucket_size:
+            return None
+        
+        # Classify trades as buy/sell using tick rule
+        # Buy if price > previous price, Sell if price < previous price
+        trades = trades.with_columns([
+            (pl.col("price") - pl.col("price").shift(1)).alias("price_change")
+        ])
+        
+        trades = trades.with_columns([
+            pl.when(pl.col("price_change") > 0)
+            .then(1)
+            .when(pl.col("price_change") < 0)
+            .then(-1)
+            .otherwise(0)
+            .alias("side_inferred")
+        ])
+        
+        # Use provided side if available, otherwise inferred
+        if "side" in trades.columns:
+            trades = trades.with_columns([
+                pl.col("side").fill_null(pl.col("side_inferred"))
+            ])
+        else:
+            trades = trades.with_columns([
+                pl.col("side_inferred").alias("side")
+            ])
+        
+        # Calculate buy and sell volumes
+        trades = trades.with_columns([
+            pl.when(pl.col("side") > 0)
+            .then(pl.col("volume"))
+            .otherwise(0)
+            .alias("buy_volume"),
+            pl.when(pl.col("side") < 0)
+            .then(pl.col("volume"))
+            .otherwise(0)
+            .alias("sell_volume"),
+        ])
+        
+        # Aggregate into buckets
+        bucket_size = self.config.bucket_size
+        num_buckets = min(self.config.num_buckets, len(trades) // bucket_size)
+        
+        if num_buckets < 2:
+            return None
+        
+        vpin_values = []
+        
+        for i in range(num_buckets):
+            start_idx = i * bucket_size
+            end_idx = (i + 1) * bucket_size
+            
+            bucket = trades.slice(start_idx, bucket_size)
+            
+            total_buy = bucket["buy_volume"].sum()
+            total_sell = bucket["sell_volume"].sum()
+            total_volume = total_buy + total_sell
+            
+            if total_volume > 0:
+                vpin = abs(total_buy - total_sell) / total_volume
+                vpin_values.append(vpin)
+        
+        if not vpin_values:
+            return None
+        
+        # Average VPIN across buckets
+        avg_vpin = np.mean(vpin_values)
+        std_vpin = np.std(vpin_values) if len(vpin_values) > 1 else 0
+        
+        # Get latest timestamp and volume
+        latest = trades.tail(1)
+        latest_ts = latest["timestamp"][0] if len(latest) > 0 else 0
+        latest_vol = latest["volume"].sum() if "volume" in latest.columns else 0
+        
+        return pl.DataFrame({
+            "symbol": [symbol],
+            "timestamp": [latest_ts],
+            "vpin": [avg_vpin],
+            "vpin_std": [std_vpin],
+            "num_buckets": [num_buckets],
+            "volume_usd": [latest_vol],
+        })
+    
+    def get_acceleration_info(self) -> Dict[str, bool]:
+        """Return detected acceleration backend info."""
+        return self.acceleration
 
 
 @ray.remote
-class ToxicityOrchestrator:
+class OrderFlowToxicityOrchestrator:
     """
-    Orchestrates cross-sectional orderflow toxicity analysis.
-    
-    Identifies assets with highest informed trading pressure.
+    Orchestrates toxicity calculation across multiple Ray workers.
+    Manages batch distribution and cross-sectional aggregation.
     """
     
-    def __init__(self, num_workers: int = 4, config: Optional[ToxicityConfig] = None):
-        self.config = config or ToxicityConfig()
+    def __init__(self, config: ToxicityConfig, num_workers: int = 4):
+        self.config = config
         self.num_workers = num_workers
-        self.workers: List[ray.actor.ActorHandle] = []
-        
-    def initialize(self) -> Dict:
-        env = init_ray_strict_memory()
-        
         self.workers = [
-            OrderflowToxicityWorker.remote(self.config)
-            for _ in range(self.num_workers)
+            OrderFlowToxicityWorker.remote(config)
+            for _ in range(num_workers)
         ]
         
-        return {'workers': len(self.workers), **env}
-    
-    def compute_cross_sectional_toxicity(
+    def process_streaming(
         self,
-        all_price_data: Dict[str, Dict[str, List[float]]],
-        all_volume_data: Dict[str, Dict[str, List[float]]]
-    ) -> pl.DataFrame:
-        """Compute toxicity scores across all assets and rank them."""
-        symbols = list(all_price_data.keys())
+        trade_stream: Generator[pl.DataFrame, None, None],
+    ) -> Generator[pl.DataFrame, None, None]:
+        """
+        Process streaming trade data for toxicity calculation.
         
-        # Distribute work
-        chunk_size = max(1, len(symbols) // self.num_workers)
-        futures = []
+        Yields:
+            DataFrames with VPIN and toxicity rankings
+        """
+        batch_idx = 0
         
-        for i, worker in enumerate(self.workers):
-            start = i * chunk_size
-            end = start + chunk_size if i < self.num_workers - 1 else len(symbols)
-            batch_symbols = symbols[start:end]
+        for trade_batch in trade_stream:
+            worker_idx = batch_idx % self.num_workers
+            worker = self.workers[worker_idx]
             
-            if batch_symbols:
-                future = worker.process_batch.remote(
-                    batch_symbols,
-                    all_price_data,
-                    all_volume_data
+            result_id = worker.process_trade_batch.remote(trade_batch, is_final=False)
+            
+            try:
+                result = ray.get(result_id, timeout=30)
+                if result is not None:
+                    yield result
+            except Exception as e:
+                print(f"Worker error: {e}")
+            
+            batch_idx += 1
+        
+        # Final flush
+        for worker in self.workers:
+            try:
+                result_id = worker.process_trade_batch.remote(
+                    pl.DataFrame(), is_final=True
                 )
-                futures.append(future)
-        
-        # Collect results
-        all_results = []
-        for future in futures:
-            batch_results = ray.get(future)
-            all_results.extend(batch_results)
-        
-        # Convert to DataFrame
-        df = pl.DataFrame(all_results)
-        
-        # Filter valid results
-        df_valid = df.filter(pl.col('valid') == True)
-        
-        # Cross-sectional ranking
-        if len(df_valid) > 0:
-            df_valid = df_valid.with_columns([
-                pl.col('toxicity_score').rank(method='dense', descending=True).alias('toxicity_rank'),
-                pl.col('vpin').rank(method='dense', descending=True).alias('vpin_rank'),
-                # Percentile
-                (pl.col('toxicity_rank') / len(df_valid)).alias('toxicity_percentile'),
-            ])
-        
-        return df_valid
-    
-    def get_most_toxic_assets(
-        self,
-        df: pl.DataFrame,
-        top_n: int = 10
-    ) -> pl.DataFrame:
-        """Get the N most toxic assets (highest informed trading pressure)."""
-        if len(df) == 0:
-            return df
-        
-        return df.sort('toxicity_rank', descending=False).head(top_n)
+                result = ray.get(result_id, timeout=30)
+                if result is not None:
+                    yield result
+            except Exception:
+                pass
     
     def shutdown(self):
+        """Clean shutdown of all workers."""
         for worker in self.workers:
             try:
                 ray.kill(worker)
-            except:
+            except Exception:
                 pass
-        self.workers.clear()
 
 
 def calculate_orderflow_toxicity(
-    price_data: Dict[str, Dict[str, List[float]]],
-    volume_data: Dict[str, Dict[str, List[float]]],
-    num_workers: int = 4,
-    config: Optional[ToxicityConfig] = None
-) -> Tuple[pl.DataFrame, Dict]:
+    trade_data_source: Generator[pl.DataFrame, None, None],
+    bucket_size: int = 1000,
+    num_buckets: int = 50,
+) -> Generator[pl.DataFrame, None, None]:
     """
-    High-level API for cross-sectional orderflow toxicity analysis.
+    Create streaming order flow toxicity calculation pipeline.
     
     Args:
-        price_data: Dict mapping symbols to price data
-        volume_data: Dict mapping symbols to volume data
-        num_workers: Number of Ray workers
-        config: Toxicity configuration
+        trade_data_source: Generator yielding trade DataFrames
+        bucket_size: Number of trades per VPIN bucket
+        num_buckets: Number of buckets for VPIN calculation
         
-    Returns:
-        Tuple of (Polars DataFrame with rankings, metadata dict)
+    Yields:
+        DataFrames with VPIN and toxicity rankings
     """
-    orchestrator = ToxicityOrchestrator.remote(num_workers, config)
+    config = ToxicityConfig(bucket_size=bucket_size, num_buckets=num_buckets)
+    orchestrator = OrderFlowToxicityOrchestrator.remote(config)
     
-    try:
-        init_info = ray.get(orchestrator.initialize.remote())
-        df = ray.get(orchestrator.compute_cross_sectional_toxicity.remote(
-            price_data, volume_data
-        ))
-        
-        metadata = {
-            'total_symbols': len(price_data),
-            'valid_symbols': len(df) if len(df) > 0 else 0,
-            'toxic_assets': len(df.filter(pl.col('is_toxic') == True)) if len(df) > 0 else 0,
-            'workers_used': num_workers,
-            'init_info': init_info,
-            'ram_quota': '4GB',
-        }
-        
-        return df, metadata
-        
-    finally:
-        ray.get(orchestrator.shutdown.remote())
+    if not ray.is_initialized():
+        ray.init(
+            _system_config={
+                "max_io_worker_cpu_use": 0.5,
+                "min_worker_size": 4 * 1024 * 1024 * 1024,
+            }
+        )
+    
+    for result in ray.get(orchestrator.process_streaming.remote(trade_data_source)):
+        yield result
+    
+    ray.get(orchestrator.shutdown.remote())
 
 
 if __name__ == "__main__":
-    # Example usage with synthetic data
-    np.random.seed(42)
-    
-    test_symbols = [f"ALT_{i}" for i in range(20)]
-    test_price_data = {}
-    test_volume_data = {}
-    
-    for symbol in test_symbols:
-        # Generate realistic-looking orderflow
-        n_trades = 200
-        
-        # Some assets have higher toxicity (more informed trading)
-        toxicity_level = np.random.uniform(0.3, 0.9)
-        
-        # Generate imbalanced orderflow for toxic assets
-        bias = np.random.choice([-1, 1]) * toxicity_level
-        signs = np.random.choice([-1, 1], size=n_trades, p=[0.5 - bias/2, 0.5 + bias/2])
-        
-        # Prices follow orderflow with noise
-        returns = signs * 0.001 + np.random.normal(0, 0.002, n_trades)
-        prices = 100 * np.exp(np.cumsum(returns))
-        
-        # Volumes correlate with toxicity
-        volumes = np.random.exponential(10 + toxicity_level * 50, n_trades)
-        
-        test_price_data[symbol] = {'prices': prices.tolist()}
-        test_volume_data[symbol] = {'volumes': volumes.tolist()}
-    
-    # Calculate toxicity
-    df, meta = calculate_orderflow_toxicity(test_price_data, test_volume_data, num_workers=2)
-    
-    print(f"\nProcessed {meta['total_symbols']} symbols")
-    print(f"Valid results: {meta['valid_symbols']}")
-    print(f"Toxic assets (>0.7 score): {meta['toxic_assets']}")
-    
-    if len(df) > 0:
-        print("\nMost Toxic Assets (Highest Informed Trading Pressure):")
-        print(df.sort('toxicity_rank').head(5)[['symbol', 'vpin', 'toxicity_score', 'is_toxic']])
+    print("Order Flow Toxicity Module - AMD Acceleration:", check_amd_acceleration())
+    config = ToxicityConfig()
+    print(f"Config: bucket_size={config.bucket_size}, num_buckets={config.num_buckets}")

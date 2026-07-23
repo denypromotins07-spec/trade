@@ -1,378 +1,265 @@
 """
-PopArt Reward Normalization for RL Training
+python/ai/reward_normalization.py
 
-Implements PopArt (Populating Returns Adaptively) reward normalization to stabilize
-RL training across highly volatile crypto regimes without manual reward clipping.
+PopArt (Populating Returns Adaptively) Reward Normalization
 
-Maintains running statistics of rewards and adaptively normalizes returns.
+Stabilizes RL training across highly volatile crypto regimes without manual reward clipping.
+Adaptively normalizes returns while preserving the ability to learn positive/negative signals.
+
+Memory Constraint: Running statistics only, O(1) memory per reward dimension.
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 import os
 
 
+def check_amd_acceleration() -> Dict[str, bool]:
+    """Detect AMD ROCm/DirectML availability."""
+    result = {"cuda": torch.cuda.is_available(), "rocm": False, "directml": False, "cpu": True}
+    if hasattr(torch.backends, 'hip') and torch.backends.hip.is_available():
+        result["rocm"] = True
+    rocm_path = os.environ.get("ROCM_PATH", "")
+    if rocm_path and os.path.exists(rocm_path):
+        result["rocm"] = True
+    if os.name == 'nt':
+        try:
+            import torch_directml
+            result["directml"] = True
+        except ImportError:
+            pass
+    return result
+
+
 @dataclass
 class PopArtConfig:
-    """Configuration for PopArt normalization."""
-    # Initial values
-    initial_mean: float = 0.0
-    initial_variance: float = 1.0
-    
-    # Update parameters
-    update_rate: float = 0.01  # Rate for updating running stats
-    epsilon: float = 1e-8  # Small constant for numerical stability
-    
-    # Clipping bounds (minimal, PopArt should avoid needing these)
-    min_reward: float = -100.0
-    max_reward: float = 100.0
-    
-    # Decay for old observations
-    decay: float = 0.99
+    shape: Tuple[int, ...] = (1,)  # Reward dimension
+    clip_range: float = 10.0  # Safety clip after normalization
+    decay: float = 0.999  # EMA decay for running stats
+    min_std: float = 1e-4  # Minimum std to prevent division by zero
 
 
-class PopArtNormalizer:
+class PopArtNormalizer(nn.Module):
     """
-    PopArt (Populating Returns Adaptively) reward normalizer.
+    PopArt reward normalization that adaptively scales rewards
+    while preserving the sign and relative magnitude.
     
-    Maintains running estimates of reward mean and variance, and adapts
-    the normalization parameters online during training.
-    
-    Unlike fixed normalization, PopArt can handle non-stationary reward
-    distributions common in crypto markets.
+    Unlike simple standardization, PopArt maintains a learned
+    scale parameter that can grow/shrink with the reward distribution.
     """
     
-    def __init__(self, output_dim: int = 1, config: Optional[PopArtConfig] = None):
-        self.output_dim = output_dim
-        self.config = config or PopArtConfig()
+    def __init__(self, config: PopArtConfig, device: str = "cpu"):
+        super().__init__()
+        self.config = config
+        self.device = device
+        self.acceleration = check_amd_acceleration()
         
-        # Running statistics (learnable parameters)
-        self.mean = torch.full((output_dim,), self.config.initial_mean)
-        self.variance = torch.full((output_dim,), self.config.initial_variance)
-        self.std = torch.sqrt(self.variance + self.config.epsilon)
+        # Running statistics (not trained via backprop)
+        self.register_buffer('running_mean', torch.zeros(config.shape))
+        self.register_buffer('running_var', torch.ones(config.shape))
+        self.register_buffer('running_max', torch.full(config.shape, -float('inf')))
+        self.register_buffer('running_min', torch.full(config.shape, float('inf')))
         
-        # Count of observations
-        self.n_observations: int = 0
+        # Learned scale parameter (trained)
+        self.scale = nn.Parameter(torch.ones(config.shape))
+        self.shift = nn.Parameter(torch.zeros(config.shape))
         
-        # AMD acceleration check
-        self._rocm_available = os.environ.get('ROCM_PATH') is not None
-        self._directml_available = os.name == 'nt' and os.environ.get('DIRECTML_PATH') is not None
+        # Count for Welford's algorithm
+        self.count = 0
         
-    def to(self, device: torch.device):
-        """Move to device."""
-        self.mean = self.mean.to(device)
-        self.variance = self.variance.to(device)
-        self.std = self.std.to(device)
-        return self
-    
-    def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
+    def update_stats(self, rewards: torch.Tensor) -> None:
         """
-        Normalize rewards using current statistics.
+        Update running statistics using Welford's online algorithm.
+        Handles batched or scalar rewards.
+        """
+        if rewards.dim() == 0:
+            rewards = rewards.unsqueeze(0)
+        
+        batch_size = rewards.shape[0]
+        self.count += batch_size
+        
+        # Update running mean and variance (Welford's)
+        delta = rewards - self.running_mean
+        self.running_mean += delta.sum(dim=0) / self.count
+        
+        if self.count > 1:
+            delta2 = rewards - self.running_mean
+            self.running_var += (delta * delta2).sum(dim=0)
+        
+        # Update running min/max for sanity checks
+        self.running_max = torch.max(self.running_max, rewards.max(dim=0)[0])
+        self.running_min = torch.min(self.running_min, rewards.min(dim=0)[0])
+        
+    def normalize(self, rewards: torch.Tensor, update_stats: bool = True) -> torch.Tensor:
+        """
+        Normalize rewards using current statistics and learned parameters.
         
         Args:
-            rewards: Raw reward tensor
+            rewards: Raw reward values
+            update_stats: Whether to update running statistics
             
         Returns:
             Normalized rewards
         """
-        # Ensure same device
-        if rewards.device != self.mean.device:
-            self.to(rewards.device)
+        if update_stats:
+            self.update_stats(rewards)
         
-        # Normalize: (r - mean) / std
-        normalized = (rewards - self.mean) / self.std
+        # Compute normalized value
+        std = torch.sqrt(self.running_var / max(1, self.count) + self.config.min_std)
+        normalized = (rewards - self.running_mean) / std
         
-        return normalized
+        # Apply learned scale and shift
+        # This allows the network to learn appropriate scaling
+        return normalized * self.scale + self.shift
     
-    def denormalize(self, normalized_values: torch.Tensor) -> torch.Tensor:
-        """
-        Denormalize values back to original scale.
-        
-        Useful for interpreting Q-values or predictions.
-        """
-        if normalized_values.device != self.mean.device:
-            self.to(normalized_values.device)
-        
-        # Denormalize: norm * std + mean
-        denormalized = normalized_values * self.std + self.mean
-        
-        return denormalized
+    def denormalize(self, normalized_rewards: torch.Tensor) -> torch.Tensor:
+        """Convert normalized rewards back to original scale."""
+        std = torch.sqrt(self.running_var / max(1, self.count) + self.config.min_std)
+        return (normalized_rewards - self.shift) / self.scale * std + self.running_mean
     
-    def update(self, rewards: torch.Tensor) -> Tuple[float, float]:
+    def update_scale_shift(self, target_mean: float = 0.0, target_var: float = 1.0) -> None:
         """
-        Update running statistics with new rewards.
-        
-        Uses Welford's online algorithm for numerical stability.
-        
-        Returns:
-            Tuple of (new_mean, new_std)
+        Update scale and shift to maintain target statistics.
+        This is the "Pop" part of PopArt - popping the statistics.
         """
-        rewards_flat = rewards.view(-1, self.output_dim)
-        n_new = len(rewards_flat)
+        std = torch.sqrt(self.running_var / max(1, self.count) + self.config.min_std)
         
-        if n_new == 0:
-            return self.mean.item(), self.std.item()
+        # Update scale to maintain unit variance
+        new_scale = std * self.scale / torch.sqrt(torch.tensor(target_var))
         
-        # Convert to float64 for precision
-        rewards_float = rewards_flat.double()
+        # Update shift to maintain zero mean
+        new_shift = (self.running_mean - target_mean) * self.scale + self.shift
         
-        # Batch statistics
-        batch_mean = rewards_float.mean(dim=0)
-        batch_var = rewards_float.var(dim=0) + self.config.epsilon
+        self.scale.data = new_scale
+        self.shift.data = new_shift
         
-        # Incremental update with weighted average
-        old_n = self.n_observations
-        new_n = old_n + n_new
+        # Reset running stats to target values
+        self.running_mean.fill_(target_mean)
+        self.running_var.fill_(target_var)
+
+
+class AdaptiveRewardNormalizer:
+    """
+    Complete adaptive reward normalization system for RL training.
+    Combines PopArt with additional crypto-specific adaptations.
+    """
+    
+    def __init__(
+        self, 
+        config: PopArtConfig,
+        use_sign_preservation: bool = True,
+        device: str = "cpu"
+    ):
+        self.config = config
+        self.device = device
+        self.popart = PopArtNormalizer(config, device)
+        self.use_sign_preservation = use_sign_preservation
         
-        if old_n == 0:
-            # First update
-            self.mean = batch_mean.float()
-            self.variance = batch_var.float()
-        else:
-            # Weighted combination
-            alpha = n_new / new_n
-            
-            # Update mean
-            delta = batch_mean - self.mean.double()
-            new_mean = self.mean.double() + alpha * delta
-            
-            # Update variance using parallel variance formula
-            # Var_total = w1*Var1 + w2*Var2 + w1*w2*(mean1-mean2)^2
-            w1 = old_n / new_n
-            w2 = n_new / new_n
-            
-            new_variance = (
-                w1 * self.variance.double() +
-                w2 * batch_var +
-                w1 * w2 * (delta ** 2)
+        # Crypto-specific: track regime changes
+        self.volatility_estimate = 0.0
+        self.volatility_decay = 0.99
+        
+    def normalize_reward(
+        self, 
+        raw_reward: float,
+        volatility: Optional[float] = None
+    ) -> float:
+        """
+        Normalize a single reward value with optional volatility adjustment.
+        
+        In high volatility regimes, we reduce the effective learning rate
+        by compressing extreme rewards.
+        """
+        reward_tensor = torch.tensor([raw_reward], dtype=torch.float32, device=self.device)
+        
+        # Apply PopArt normalization
+        normalized = self.popart.normalize(reward_tensor, update_stats=True)
+        
+        # Volatility adjustment (crypto-specific)
+        if volatility is not None:
+            # Update exponential volatility estimate
+            self.volatility_estimate = (
+                self.volatility_decay * self.volatility_estimate +
+                (1 - self.volatility_decay) * volatility
             )
             
-            self.mean = new_mean.float()
-            self.variance = new_variance.float()
+            # Compress rewards during high volatility
+            if self.volatility_estimate > 0.1:  # High vol threshold
+                compression = 1.0 / (1.0 + self.volatility_estimate)
+                normalized = normalized * compression
         
-        self.n_observations = new_n
-        self.std = torch.sqrt(self.variance + self.config.epsilon)
+        # Sign preservation: ensure normalized reward has same sign as raw
+        if self.use_sign_preservation:
+            sign_mask = torch.sign(raw_reward) == torch.sign(normalized)
+            if not sign_mask.all():
+                # Adjust to preserve sign
+                normalized = torch.where(
+                    sign_mask,
+                    normalized,
+                    torch.sign(raw_reward) * normalized.abs()
+                )
         
-        return self.mean.item() if self.output_dim == 1 else self.mean.tolist(), \
-               self.std.item() if self.output_dim == 1 else self.std.tolist()
+        # Safety clipping
+        normalized = torch.clamp(normalized, -self.config.clip_range, self.config.clip_range)
+        
+        return normalized.item()
     
-    def reset(self):
-        """Reset statistics to initial values."""
-        self.mean.fill_(self.config.initial_mean)
-        self.variance.fill_(self.config.initial_variance)
-        self.std = torch.sqrt(self.variance + self.config.epsilon)
-        self.n_observations = 0
+    def normalize_batch(
+        self,
+        rewards: np.ndarray,
+        volatilities: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Normalize a batch of rewards."""
+        reward_tensor = torch.FloatTensor(rewards).to(self.device)
+        
+        normalized = self.popart.normalize(reward_tensor, update_stats=True)
+        
+        if volatilities is not None:
+            vol_tensor = torch.FloatTensor(volatilities).to(self.device)
+            compression = 1.0 / (1.0 + vol_tensor)
+            normalized = normalized * compression.unsqueeze(-1)
+        
+        normalized = torch.clamp(normalized, -self.config.clip_range, self.config.clip_range)
+        
+        return normalized.cpu().numpy()
     
-    def get_stats(self) -> Dict:
-        """Get current statistics."""
+    def get_state_dict(self) -> Dict:
+        """Get serializable state dict."""
         return {
-            'mean': self.mean.item() if self.output_dim == 1 else self.mean.tolist(),
-            'variance': self.variance.item() if self.output_dim == 1 else self.variance.tolist(),
-            'std': self.std.item() if self.output_dim == 1 else self.std.tolist(),
-            'n_observations': self.n_observations,
-            'rocm_available': self._rocm_available,
-            'directml_available': self._directml_available,
+            'running_mean': self.popart.running_mean.cpu().numpy(),
+            'running_var': self.popart.running_var.cpu().numpy(),
+            'scale': self.popart.scale.data.cpu().numpy(),
+            'shift': self.popart.shift.data.cpu().numpy(),
+            'count': self.popart.count,
+            'volatility_estimate': self.volatility_estimate,
         }
-
-
-class PopArtHead(nn.Module):
-    """
-    Neural network head with integrated PopArt normalization.
     
-    This is typically used as the final layer of a critic network,
-    allowing the network to learn unnormalized values while outputting
-    normalized predictions.
-    """
-    
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int = 1,
-        hidden_dim: int = 256,
-        config: Optional[PopArtConfig] = None
-    ):
-        super().__init__()
-        
-        self.popart = PopArtNormalizer(output_dim, config)
-        
-        # Network layers
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        # Initialize last layer weights small for stability
-        nn.init.zeros_(self.network[-1].weight)
-        nn.init.constant_(self.network[-1].bias, config.initial_mean if config else 0.0)
-        
-    def forward(
-        self,
-        x: torch.Tensor,
-        normalize: bool = True
-    ) -> torch.Tensor:
-        """
-        Forward pass through network.
-        
-        Args:
-            x: Input tensor
-            normalize: If True, apply PopArt normalization to output
-            
-        Returns:
-            (Normalized) output tensor
-        """
-        raw_output = self.network(x)
-        
-        if normalize:
-            return self.popart.normalize(raw_output)
-        else:
-            return raw_output
-    
-    def predict_unnormalized(
-        self,
-        x: torch.Tensor
-    ) -> torch.Tensor:
-        """Get unnormalized predictions (for interpretation)."""
-        raw_output = self.network(x)
-        return self.popart.denormalize(raw_output)
-    
-    def update_stats(self, targets: torch.Tensor) -> Dict:
-        """Update PopArt statistics with target values."""
-        mean, std = self.popart.update(targets)
-        return {'mean': mean, 'std': std}
-
-
-class PopArtSACLoss:
-    """
-    SAC loss function with PopArt reward normalization.
-    
-    Integrates PopArt into the SAC training loop for stable learning
-    across varying reward scales.
-    """
-    
-    def __init__(
-        self,
-        popart_normalizer: PopArtNormalizer,
-        gamma: float = 0.99
-    ):
-        self.popart = popart_normalizer
-        self.gamma = gamma
-        
-    def compute_critic_loss(
-        self,
-        q_values: torch.Tensor,
-        target_values: torch.Tensor,
-        dones: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute critic loss with PopArt normalization.
-        
-        The key insight is that we normalize targets before computing loss,
-        but the critic learns to predict normalized values.
-        """
-        # Normalize targets
-        normalized_targets = self.popart.normalize(target_values)
-        
-        # Also normalize terminal states properly
-        # When done=True, target should be just reward (no bootstrap)
-        normalized_dones = self.popart.normalize(torch.zeros_like(target_values))
-        
-        # MSE loss on normalized values
-        loss = nn.functional.mse_loss(q_values, normalized_targets)
-        
-        metrics = {
-            'critic_loss': loss.item(),
-            'q_values_mean': q_values.mean().item(),
-            'targets_mean': target_values.mean().item(),
-            'popart_mean': self.popart.mean.item(),
-            'popart_std': self.popart.std.item(),
-        }
-        
-        return loss, metrics
-    
-    def update_and_compute_loss(
-        self,
-        q_values: torch.Tensor,
-        rewards: torch.Tensor,
-        next_q_values: torch.Tensor,
-        dones: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Full critic loss computation with PopArt update.
-        
-        1. Compute TD targets
-        2. Update PopArt statistics
-        3. Compute normalized loss
-        """
-        # Compute TD targets
-        with torch.no_grad():
-            targets = rewards + self.gamma * (1 - dones) * next_q_values
-        
-        # Update PopArt statistics (online learning)
-        self.popart.update(targets)
-        
-        # Compute loss with normalized targets
-        return self.compute_critic_loss(q_values, targets, dones)
+    def load_state_dict(self, state: Dict) -> None:
+        """Load from state dict."""
+        self.popart.running_mean = torch.FloatTensor(state['running_mean']).to(self.device)
+        self.popart.running_var = torch.FloatTensor(state['running_var']).to(self.device)
+        self.popart.scale.data = torch.FloatTensor(state['scale']).to(self.device)
+        self.popart.shift.data = torch.FloatTensor(state['shift']).to(self.device)
+        self.popart.count = state['count']
+        self.volatility_estimate = state.get('volatility_estimate', 0.0)
 
 
 if __name__ == "__main__":
-    # Test PopArt implementation
-    print("Testing PopArt Reward Normalization...")
+    print("Reward Normalization (PopArt) - AMD Acceleration:", check_amd_acceleration())
     
-    # Create normalizer
-    popart = PopArtNormalizer(output_dim=1)
+    config = PopArtConfig(shape=(1,))
+    normalizer = AdaptiveRewardNormalizer(config)
     
-    # Simulate training with varying reward scales
-    np.random.seed(42)
+    # Simulate crypto reward sequence with varying volatility
+    rewards = [1.0, -0.5, 2.0, -1.0, 5.0, -3.0, 10.0, -8.0]
+    volatilities = [0.02, 0.03, 0.05, 0.08, 0.15, 0.20, 0.30, 0.25]
     
-    print("\nSimulating reward normalization across volatile regimes...")
+    print("\nRaw rewards -> Normalized:")
+    for r, v in zip(rewards, volatilities):
+        norm_r = normalizer.normalize_reward(r, volatility=v)
+        print(f"  {r:7.2f} (vol={v:.2f}) -> {norm_r:7.4f}")
     
-    for episode in range(10):
-        # Different reward regimes (simulating crypto volatility)
-        if episode < 3:
-            # Low volatility regime
-            rewards = np.random.randn(100, 1) * 0.1
-        elif episode < 6:
-            # High volatility regime
-            rewards = np.random.randn(100, 1) * 10.0
-        else:
-            # Extreme regime
-            rewards = np.random.randn(100, 1) * 100.0
-        
-        rewards_tensor = torch.FloatTensor(rewards)
-        
-        # Update statistics
-        mean, std = popart.update(rewards_tensor)
-        
-        # Normalize
-        normalized = popart.normalize(rewards_tensor)
-        
-        print(f"Episode {episode + 1}:")
-        print(f"  Raw rewards: mean={rewards.mean():.4f}, std={rewards.std():.4f}")
-        print(f"  PopArt stats: mean={mean:.4f}, std={std:.4f}")
-        print(f"  Normalized: mean={normalized.mean().item():.4f}, std={normalized.std().item():.4f}")
-    
-    # Test PopArt head
-    print("\n\nTesting PopArt Head...")
-    
-    popart_head = PopArtHead(input_dim=64, output_dim=1)
-    
-    # Forward pass
-    x = torch.randn(32, 64)
-    output = popart_head(x, normalize=True)
-    output_unnorm = popart_head.predict_unnormalized(x)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Normalized output: mean={output.mean().item():.4f}, std={output.std().item():.4f}")
-    print(f"Unnormalized output: mean={output_unnorm.mean().item():.4f}, std={output_unnorm.std().item():.4f}")
-    
-    # Get stats
-    stats = popart.get_stats()
-    print(f"\nFinal PopArt stats: {stats}")
-    
-    print("\nPopArt test completed successfully!")
+    print(f"\nFinal state: {normalizer.get_state_dict()}")

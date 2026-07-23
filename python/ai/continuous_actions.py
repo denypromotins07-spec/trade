@@ -1,10 +1,13 @@
 """
+python/ai/continuous_actions.py
+
 Soft Actor-Critic (SAC) with Continuous Action Spaces
 
 Implements SAC for precise limit order price offset and size generation.
-Strictly bounds outputs to prevent OOM and enforces 4GB Python RAM quota.
+Actions are strictly bounded to prevent OOM and ensure valid order parameters.
+Optimized for AMD Ryzen AI 5 with ROCm/DirectML acceleration checks.
 
-Includes AMD ROCm/DirectML environment checks for hardware acceleration.
+Memory Constraint: Network sizes bounded, gradient clipping enforced.
 """
 
 import torch
@@ -12,485 +15,318 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Dict, Optional, List
+from dataclasses import dataclass
 import os
-import gc
 
-# Check for AMD ROCm/DirectML availability
+
 def check_amd_acceleration() -> Dict[str, bool]:
-    """Check for AMD GPU acceleration options."""
-    rocm_available = torch.cuda.is_available() and \
-                    (os.environ.get('ROCM_PATH') is not None or 
-                     os.path.exists('/opt/rocm'))
-    
-    # DirectML for Windows AMD acceleration
-    directml_available = False
-    try:
-        if os.name == 'nt':
-            import torch_directml
-            directml_available = True
-    except ImportError:
-        pass
-    
-    return {
-        'rocm_available': rocm_available,
-        'directml_available': directml_available,
-        'cuda_available': torch.cuda.is_available(),
+    """Detect AMD ROCm/DirectML availability for PyTorch acceleration."""
+    result = {
+        "cuda": torch.cuda.is_available(),
+        "rocm": False,
+        "directml": False,
+        "cpu": True,
     }
-
-
-def get_device():
-    """Get optimal device based on available hardware."""
-    accel = check_amd_acceleration()
     
-    if accel['rocm_available']:
-        return torch.device('cuda')
-    elif accel['directml_available']:
+    if hasattr(torch.backends, 'hip') and torch.backends.hip.is_available():
+        result["rocm"] = True
+    
+    rocm_path = os.environ.get("ROCM_PATH", "")
+    if rocm_path and os.path.exists(rocm_path):
+        result["rocm"] = True
+    
+    if os.name == 'nt':
         try:
             import torch_directml
-            return torch.device('dml')
-        except:
+            result["directml"] = True
+        except ImportError:
             pass
     
-    return torch.device('cpu')
+    return result
 
 
-class ReplayBuffer:
-    """
-    Bounded replay buffer with strict memory limits.
-    
-    Enforces 4GB RAM quota by limiting buffer size and triggering GC.
-    """
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        max_size: int = 100_000,  # Bounded to prevent OOM
-        max_memory_bytes: int = int(4.0 * 1024 * 1024 * 1024)  # 4GB limit
-    ):
-        self.max_size = max_size
-        self.max_memory_bytes = max_memory_bytes
-        
-        # Pre-allocate arrays for efficiency
-        self.observations = np.zeros((max_size, obs_dim), dtype=np.float32)
-        self.actions = np.zeros((max_size, action_dim), dtype=np.float32)
-        self.rewards = np.zeros(max_size, dtype=np.float32)
-        self.next_observations = np.zeros((max_size, obs_dim), dtype=np.float32)
-        self.dones = np.zeros(max_size, dtype=bool)
-        
-        self.ptr = 0
-        self.size = 0
-        
-    def add(
-        self,
-        obs: np.ndarray,
-        action: np.ndarray,
-        reward: float,
-        next_obs: np.ndarray,
-        done: bool
-    ):
-        """Add transition to buffer."""
-        self.observations[self.ptr] = obs
-        self.actions[self.ptr] = action
-        self.rewards[self.ptr] = reward
-        self.next_observations[self.ptr] = next_obs
-        self.dones[self.ptr] = done
-        
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-        
-        # Memory pressure check
-        if self.size % 10000 == 0:
-            self._check_memory_pressure()
-    
-    def sample_batch(
-        self,
-        batch_size: int,
-        device: torch.device
-    ) -> Tuple[torch.Tensor, ...]:
-        """Sample a batch of transitions."""
-        indices = np.random.choice(min(self.size, len(self.rewards)), batch_size, replace=False)
-        
-        obs = torch.FloatTensor(self.observations[indices]).to(device)
-        actions = torch.FloatTensor(self.actions[indices]).to(device)
-        rewards = torch.FloatTensor(self.rewards[indices]).to(device)
-        next_obs = torch.FloatTensor(self.next_observations[indices]).to(device)
-        dones = torch.FloatTensor(self.dones[indices]).to(device)
-        
-        return obs, actions, rewards, next_obs, dones
-    
-    def _check_memory_pressure(self):
-        """Force GC if approaching memory limit."""
-        estimated_bytes = (
-            self.observations.nbytes +
-            self.actions.nbytes +
-            self.rewards.nbytes +
-            self.next_observations.nbytes +
-            self.dones.nbytes
-        )
-        
-        if estimated_bytes > self.max_memory_bytes * 0.9:
-            gc.collect()
+@dataclass
+class SACConfig:
+    """Configuration for SAC continuous action space."""
+    state_dim: int
+    action_dim: int  # 2: [price_offset, order_size]
+    hidden_dim: int = 256
+    max_action_price_offset: float = 0.02  # Max 2% from mid price
+    max_action_size: float = 1.0  # Normalized max order size
+    min_action_size: float = 0.01  # Min 1% of portfolio
+    learning_rate: float = 3e-4
+    gamma: float = 0.99
+    tau: float = 0.005
+    target_entropy: Optional[float] = None
+    max_memory_gb: float = 4.0  # Python RAM quota
 
 
-class Actor(nn.Module):
-    """
-    SAC Actor network with continuous action output.
+class BoundedContinuousAction(nn.Module):
+    """Neural network for bounded continuous action output."""
     
-    Outputs mean and log_std for Gaussian policy.
-    Actions are bounded to prevent extreme values.
-    """
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        hidden_dims: List[int] = [256, 256],
-        action_bounds: Tuple[float, float] = (-1.0, 1.0),
-        log_std_min: float = -20,
-        log_std_max: float = 2
-    ):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super().__init__()
         
-        self.action_dim = action_dim
-        self.action_bounds = action_bounds
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         
-        # Build network
-        layers = []
-        prev_dim = obs_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            prev_dim = hidden_dim
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
         
-        self.backbone = nn.Sequential(*layers)
+        self.log_std_min = -20
+        self.log_std_max = 2
         
-        # Policy heads
-        self.mean_head = nn.Linear(hidden_dims[-1], action_dim)
-        self.log_std_head = nn.Linear(hidden_dims[-1], action_dim)
-        
-    def forward(
-        self,
-        obs: torch.Tensor,
-        deterministic: bool = False,
-        with_log_prob: bool = True
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass returning sampled action.
-        
-        Args:
-            obs: Observation tensor
-            deterministic: If True, use mean action (for evaluation)
-            with_log_prob: If True, also return log probability
-            
-        Returns:
-            action: Sampled action (bounded)
-            log_prob: Log probability of action (if requested)
-        """
-        x = self.backbone(obs)
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
         
         mean = self.mean_head(x)
         log_std = self.log_std_head(x)
-        
-        # Clip log_std for stability
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-        std = torch.exp(log_std)
+        
+        return mean, log_std
+    
+    def get_action(
+        self, 
+        state: torch.Tensor, 
+        deterministic: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
         
         if deterministic:
             action = mean
-            log_prob = None
         else:
-            # Reparameterization trick
             normal = torch.distributions.Normal(mean, std)
-            z = normal.rsample()  # Reparameterized sample
-            action = torch.tanh(z)  # Bound to [-1, 1]
-            
-            if with_log_prob:
-                # Compute log prob with tanh correction
-                log_prob = normal.log_prob(z)
-                log_prob = log_prob.sum(dim=-1, keepdim=True)
-                # Tanh correction
-                log_prob = log_prob - torch.log(1 - action.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
+            x_t = normal.rsample()
+            action = torch.tanh(x_t)
         
-        # Scale action to actual bounds
-        low, high = self.action_bounds
-        action = low + (action + 1.0) * 0.5 * (high - low)
+        log_prob = normal.log_prob(x_t)
+        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
         
         return action, log_prob
 
 
-class Critic(nn.Module):
-    """
-    SAC Critic network (Q-function).
+class ContinuousCritic(nn.Module):
+    """Q-network critic for continuous actions."""
     
-    Takes observation and action as input, outputs Q-value.
-    """
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        hidden_dims: List[int] = [256, 256]
-    ):
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
         super().__init__()
         
-        # Q1 network
-        q1_layers = []
-        prev_dim = obs_dim + action_dim
-        for hidden_dim in hidden_dims:
-            q1_layers.append(nn.Linear(prev_dim, hidden_dim))
-            q1_layers.append(nn.ReLU())
-            prev_dim = hidden_dim
-        q1_layers.append(nn.Linear(hidden_dims[-1], 1))
-        self.q1 = nn.Sequential(*q1_layers)
+        self.q1 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
         
-        # Q2 network (for double Q-learning)
-        q2_layers = []
-        prev_dim = obs_dim + action_dim
-        for hidden_dim in hidden_dims:
-            q2_layers.append(nn.Linear(prev_dim, hidden_dim))
-            q2_layers.append(nn.ReLU())
-            prev_dim = hidden_dim
-        q2_layers.append(nn.Linear(hidden_dims[-1], 1))
-        self.q2 = nn.Sequential(*q2_layers)
-        
-    def forward(
-        self,
-        obs: torch.Tensor,
-        action: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning Q-values from both critics."""
-        x = torch.cat([obs, action], dim=-1)
-        q1 = self.q1(x)
-        q2 = self.q2(x)
-        return q1, q2
+        self.q2 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sa = torch.cat([state, action], dim=-1)
+        return self.q1(sa), self.q2(sa)
+    
+    def q1(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        sa = torch.cat([state, action], dim=-1)
+        return self.q1(sa)
 
 
 class SoftActorCritic:
-    """
-    Complete SAC implementation for continuous control.
+    """Soft Actor-Critic agent with continuous action spaces."""
     
-    Designed for limit order price offset and size generation.
-    Strictly bounded outputs and memory-limited.
-    """
-    
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        lr: float = 3e-4,
-        gamma: float = 0.99,
-        tau: float = 0.005,
-        alpha: float = 0.2,
-        target_update_interval: int = 1,
-        action_bounds: Tuple[float, float] = (-1.0, 1.0),
-        max_memory_bytes: int = int(4.0 * 1024 * 1024 * 1024)
-    ):
-        self.gamma = gamma
-        self.tau = tau
-        self.alpha = alpha
-        self.target_update_interval = target_update_interval
-        self.action_bounds = action_bounds
-        self._step = 0
+    def __init__(self, config: SACConfig):
+        self.config = config
+        self.acceleration = check_amd_acceleration()
+        self.device = self._select_device()
         
-        # Get device (checks for AMD ROCm/DirectML)
-        self.device = get_device()
-        self.accel_info = check_amd_acceleration()
+        if config.target_entropy is None:
+            config.target_entropy = -np.prod(config.action_dim)
         
-        # Initialize networks
-        self.actor = Actor(obs_dim, action_dim, action_bounds=action_bounds).to(self.device)
-        self.critic = Critic(obs_dim, action_dim).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim).to(self.device)
+        self.actor = BoundedContinuousAction(
+            config.state_dim, config.action_dim, config.hidden_dim
+        ).to(self.device)
         
-        # Copy weights to target
+        self.critic = ContinuousCritic(
+            config.state_dim, config.action_dim, config.hidden_dim
+        ).to(self.device)
+        
+        self.critic_target = ContinuousCritic(
+            config.state_dim, config.action_dim, config.hidden_dim
+        ).to(self.device)
+        
         self._soft_update(1.0)
         
-        # Optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        
-        # Temperature parameter (auto-tuned)
-        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=self.device)
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
-        
-        # Target entropy for auto-tuning
-        self.target_entropy = -np.prod(action_dim) if isinstance(action_dim, tuple) else -action_dim
-        
-        # Replay buffer with memory limits
-        self.replay_buffer = ReplayBuffer(
-            obs_dim, action_dim,
-            max_size=100_000,
-            max_memory_bytes=max_memory_bytes
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=config.learning_rate
+        )
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(), lr=config.learning_rate
         )
         
+        self.log_alpha = torch.tensor(np.log(1.0), requires_grad=True, device=self.device)
+        self.alpha_optimizer = torch.optim.Adam(
+            [self.log_alpha], lr=config.learning_rate
+        )
+        
+        self._check_memory_usage()
+    
+    def _select_device(self) -> str:
+        if self.acceleration["rocm"]:
+            return "cuda"
+        elif self.acceleration["directml"]:
+            return "privateuseone"
+        elif self.acceleration["cuda"]:
+            return "cuda"
+        return "cpu"
+    
+    def _check_memory_usage(self) -> None:
+        import psutil
+        process = psutil.Process()
+        current_gb = process.memory_info().rss / (1024 ** 3)
+        
+        if current_gb > self.config.max_memory_gb * 0.8:
+            print(f"Warning: Memory at {current_gb:.2f}GB, approaching {self.config.max_memory_gb}GB limit")
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
     def select_action(
-        self,
-        obs: np.ndarray,
+        self, 
+        state: np.ndarray, 
         deterministic: bool = False
-    ) -> np.ndarray:
-        """Select action given observation."""
+    ) -> Tuple[np.ndarray, float]:
         with torch.no_grad():
-            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            action, _ = self.actor(obs_tensor, deterministic=deterministic)
-            return action.cpu().numpy()[0]
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action, log_prob = self.actor.get_action(state_tensor, deterministic)
+            scaled_action = self._scale_action(action.squeeze(0))
+            return scaled_action.cpu().numpy(), log_prob.item()
+    
+    def _scale_action(self, action: torch.Tensor) -> torch.Tensor:
+        price_offset = action[..., 0] * self.config.max_action_price_offset
+        order_size = (
+            (action[..., 1] + 1) / 2 *
+            (self.config.max_action_size - self.config.min_action_size) +
+            self.config.min_action_size
+        )
+        return torch.stack([price_offset, order_size], dim=-1)
     
     def update(
-        self,
+        self, 
+        replay_buffer: List[Tuple],
         batch_size: int = 256
     ) -> Dict[str, float]:
-        """Perform one update step."""
-        if self.replay_buffer.size < batch_size:
+        if len(replay_buffer) < batch_size:
             return {}
         
-        # Sample batch
-        obs, actions, rewards, next_obs, dones = self.replay_buffer.sample_batch(
-            batch_size, self.device
-        )
+        indices = np.random.choice(len(replay_buffer), batch_size, replace=False)
+        batch = [replay_buffer[i] for i in indices]
         
-        metrics = {}
+        states = torch.FloatTensor(np.array([b[0] for b in batch])).to(self.device)
+        actions = torch.FloatTensor(np.array([b[1] for b in batch])).to(self.device)
+        rewards = torch.FloatTensor(np.array([b[2] for b in batch])).unsqueeze(1).to(self.device)
+        next_states = torch.FloatTensor(np.array([b[3] for b in batch])).to(self.device)
+        dones = torch.FloatTensor(np.array([b[4] for b in batch])).unsqueeze(1).to(self.device)
         
-        # Update critic
-        critic_loss, q1_mean, q2_mean = self._update_critic(
-            obs, actions, rewards, next_obs, dones
-        )
-        metrics['critic_loss'] = critic_loss
-        metrics['q1_mean'] = q1_mean
-        metrics['q2_mean'] = q2_mean
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         
-        # Update actor
-        actor_loss, alpha_loss, entropy = self._update_actor(obs)
-        metrics['actor_loss'] = actor_loss
-        metrics['alpha'] = self.log_alpha.exp().item()
-        metrics['entropy'] = entropy
+        critic_loss = self._update_critic(states, actions, rewards, next_states, dones)
+        actor_loss = self._update_actor(states)
+        alpha_loss = self._update_temperature(states)
         
-        # Update target networks
-        if self._step % self.target_update_interval == 0:
-            self._soft_update(self.tau)
+        self._soft_update(self.config.tau)
+        self._check_memory_usage()
         
-        self._step += 1
-        
-        # Memory check
-        if self._step % 1000 == 0:
-            gc.collect()
-        
-        return metrics
+        return {
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "alpha_loss": alpha_loss.item() if alpha_loss is not None else 0.0,
+            "alpha": self.log_alpha.exp().item()
+        }
     
     def _update_critic(
-        self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        next_obs: torch.Tensor,
-        dones: torch.Tensor
-    ) -> Tuple[float, float, float]:
-        """Update critic networks."""
+        self, states: torch.Tensor, actions: torch.Tensor,
+        rewards: torch.Tensor, next_states: torch.Tensor, dones: torch.Tensor
+    ) -> torch.Tensor:
         with torch.no_grad():
-            # Next action and Q-value
-            next_action, next_log_prob = self.actor(next_obs, with_log_prob=True)
-            next_q1, next_q2 = self.critic_target(next_obs, next_action)
-            min_next_q = torch.min(next_q1, next_q2)
-            
-            # Target Q-value
-            target_q = rewards + self.gamma * (1 - dones) * (min_next_q - self.alpha * next_log_prob)
+            next_action, next_log_prob = self.actor.get_action(next_states)
+            next_scaled_action = self._scale_action(next_action)
+            target_q1, target_q2 = self.critic_target(next_states, next_scaled_action)
+            target_q = torch.min(target_q1, target_q2)
+            target_q = rewards + self.config.gamma * (1 - dones) * (
+                target_q - self.log_alpha.exp() * next_log_prob
+            )
         
-        # Current Q-values
-        current_q1, current_q2 = self.critic(obs, actions)
+        current_q1, current_q2 = self.critic(states, actions)
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         
-        # Critic loss (MSE)
-        q1_loss = F.mse_loss(current_q1, target_q)
-        q2_loss = F.mse_loss(current_q2, target_q)
-        critic_loss = q1_loss + q2_loss
-        
-        # Optimize
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
         
-        return critic_loss.item(), current_q1.mean().item(), current_q2.mean().item()
+        return critic_loss
     
-    def _update_actor(
-        self,
-        obs: torch.Tensor
-    ) -> Tuple[float, float, float]:
-        """Update actor network and temperature."""
-        # Actor loss
-        action, log_prob = self.actor(obs, with_log_prob=True)
-        q1, q2 = self.critic(obs, action)
-        min_q = torch.min(q1, q2)
-        
-        actor_loss = (self.alpha * log_prob - min_q).mean()
+    def _update_actor(self, states: torch.Tensor) -> torch.Tensor:
+        action, log_prob = self.actor.get_action(states)
+        scaled_action = self._scale_action(action)
+        q1, q2 = self.critic(states, scaled_action)
+        q = torch.min(q1, q2)
+        actor_loss = (self.log_alpha.exp() * log_prob - q).mean()
         
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
         
-        # Temperature update (auto-tune alpha)
+        return actor_loss
+    
+    def _update_temperature(self, states: torch.Tensor) -> Optional[torch.Tensor]:
         with torch.no_grad():
-            _, log_prob = self.actor(obs, with_log_prob=True)
-        
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy)).mean()
-        
+            _, log_prob = self.actor.get_action(states)
+        alpha_loss = -(self.log_alpha * (log_prob + self.config.target_entropy).detach()).mean()
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
-        
-        return actor_loss.item(), alpha_loss.item(), -log_prob.mean().item()
+        return alpha_loss
     
-    def _soft_update(self, tau: float):
-        """Soft update of target networks."""
-        for param, target_param in zip(
-            self.critic.parameters(),
-            self.critic_target.parameters()
+    def _soft_update(self, tau: float) -> None:
+        for target_param, param in zip(
+            self.critic_target.parameters(), self.critic.parameters()
         ):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
     
-    def get_memory_stats(self) -> Dict:
-        """Return memory statistics."""
-        return {
-            'buffer_size': self.replay_buffer.size,
-            'buffer_max': self.replay_buffer.max_size,
-            'accel_info': self.accel_info,
-            'device': str(self.device),
+    def save_checkpoint(self, path: str) -> None:
+        checkpoint = {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "config": self.config,
         }
+        torch.save(checkpoint, path)
+    
+    def load_checkpoint(self, path: str) -> None:
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.critic_target.load_state_dict(checkpoint["critic_target"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
 
 
 if __name__ == "__main__":
-    # Test SAC implementation
-    print("Testing SAC with Continuous Actions...")
-    
-    # Create agent
-    agent = SoftActorCritic(
-        obs_dim=10,
-        action_dim=2,  # price_offset, order_size
-        action_bounds=(-0.5, 0.5),  # Bounded action space
-    )
-    
-    print(f"Device: {agent.device}")
-    print(f"Acceleration: {agent.accel_info}")
-    
-    # Simulate some training steps
-    obs_dim = 10
-    action_dim = 2
-    
-    for step in range(100):
-        obs = np.random.randn(obs_dim).astype(np.float32)
-        action = agent.select_action(obs)
-        
-        # Simulate environment step
-        next_obs = np.random.randn(obs_dim).astype(np.float32)
-        reward = np.random.randn()
-        done = step % 100 == 99
-        
-        # Add to buffer
-        agent.replay_buffer.add(obs, action, reward, next_obs, done)
-        
-        # Update
-        if step >= 10:
-            metrics = agent.update(batch_size=32)
-    
-    print(f"\nMemory stats: {agent.get_memory_stats()}")
-    print("SAC test completed successfully!")
+    print("SAC Continuous Actions - AMD Acceleration:", check_amd_acceleration())
+    config = SACConfig(state_dim=10, action_dim=2)
+    agent = SoftActorCritic(config)
+    state = np.random.randn(10)
+    action, log_prob = agent.select_action(state)
+    print(f"Sample action: {action}, log_prob: {log_prob}")
