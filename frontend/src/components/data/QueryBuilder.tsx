@@ -1,495 +1,383 @@
 /**
- * QueryBuilder.tsx - Data Exploration: Visual Node-Based Query Builder
+ * File 10: QueryBuilder.tsx
+ * Chapter 4: Data Exploration & Custom Query Builder
  * 
- * Provides a visual node-based UI to construct complex Polars and DuckDB
- * analytical queries, translating visual graphs into strict Rust IPC payloads.
+ * Visual node-based UI to construct complex Polars and DuckDB analytical queries,
+ * translating visual graphs into strict Rust IPC payloads.
  * 
  * Features:
- * - Drag-and-drop node-based query builder
- * - Visual graph representation of data transformations
- * - Input sanitization to prevent injection attacks
- * - Rust IPC payload generation for backend execution
- * - Cyberpunk-styled node connections with animated flows
+ * - Node-based visual query builder
+ * - Input sanitization (prevents SQL/DuckDB injection)
+ * - Real-time query preview
+ * - Rust IPC payload generation
  */
 
-'use client';
+import React, { useState, useCallback, useMemo } from 'react';
 
-import React, { useState, useCallback, useMemo, useRef } from 'react';
+// --- Types ---
 
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
-type NodeType = 'source' | 'filter' | 'aggregate' | 'join' | 'select' | 'sort' | 'output';
-
-interface QueryNode {
+interface Node {
   id: string;
-  type: NodeType;
+  type: 'source' | 'filter' | 'aggregate' | 'transform' | 'output';
   position: { x: number; y: number };
-  config: Record<string, any>;
-  label: string;
+  config: Record<string, unknown>;
 }
 
-interface NodeConnection {
-  from: string;
-  to: string;
+interface Edge {
+  source: string;
+  target: string;
 }
 
 interface QueryGraph {
-  nodes: QueryNode[];
-  connections: NodeConnection[];
+  nodes: Node[];
+  edges: Edge[];
 }
 
-interface QueryBuilderProps {
-  initialGraph?: QueryGraph;
-  onExecute?: (payload: RustPayload) => void;
+interface Props {
+  onGenerate?: (payload: RustPayload) => void;
 }
 
 interface RustPayload {
-  query_type: string;
-  operations: any[];
+  query_type: 'polars' | 'duckdb';
+  operations: Operation[];
   sanitized: boolean;
   checksum: string;
 }
 
-// ============================================================================
-// Constants & Configuration
-// ============================================================================
+interface Operation {
+  op: string;
+  params: Record<string, unknown>;
+}
 
-const NODE_TYPES: Record<NodeType, { icon: string; color: string; label: string }> = {
-  source: { icon: '📊', color: '#00ff88', label: 'Data Source' },
-  filter: { icon: '🔍', color: '#00ccff', label: 'Filter' },
-  aggregate: { icon: '📈', color: '#ffcc00', label: 'Aggregate' },
-  join: { icon: '🔗', color: '#ff6600', label: 'Join' },
-  select: { icon: '✓', color: '#00ff00', label: 'Select Columns' },
-  sort: { icon: '↕️', color: '#ff00ff', label: 'Sort' },
-  output: { icon: '💾', color: '#ff0088', label: 'Output' },
+// --- Constants ---
+
+const NODE_TYPES = {
+  source: { label: 'DATA_SOURCE', color: '#00f3ff', icon: '📊' },
+  filter: { label: 'FILTER', color: '#00ff9d', icon: '🔍' },
+  aggregate: { label: 'AGGREGATE', color: '#ffaa00', icon: '∑' },
+  transform: { label: 'TRANSFORM', color: '#bd00ff', icon: '🔄' },
+  output: { label: 'OUTPUT', color: '#ff0055', icon: '📤' },
 };
 
-const CANVAS_SIZE = { width: 800, height: 500 };
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/**
- * Generates a unique ID for nodes
- */
-const generateId = (): string => {
-  return `node-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const COLORS = {
+  bg: '#0a0a0a',
+  panel: 'rgba(20, 20, 30, 0.8)',
+  border: '#333333',
+  text: '#c0c0c0',
+  highlight: '#00f3ff',
+  error: '#ff0055',
 };
 
 /**
- * Sanitizes user input to prevent SQL/DuckDB injection
+ * Sanitize user input to prevent injection attacks
  */
 const sanitizeInput = (input: string): string => {
-  // Remove potentially dangerous characters
-  const sanitized = input
-    .replace(/[;'"\\]/g, '') // Remove semicolons, quotes, backslashes
-    .replace(/\b(DROP|DELETE|INSERT|UPDATE|ALTER)\b/gi, '') // Block SQL keywords
-    .trim();
+  const dangerous = [';', '--', '/*', '*/', 'DROP', 'DELETE', 'TRUNCATE', 'ALTER'];
+  let sanitized = input.toUpperCase();
   
-  return sanitized;
+  for (const pattern of dangerous) {
+    if (sanitized.includes(pattern)) {
+      console.warn(`[SECURITY] Blocked potential injection: ${pattern}`);
+      return '';
+    }
+  }
+  
+  return input.replace(/[^a-zA-Z0-9_.,\s*+\-/%=<>!]/g, '');
 };
 
 /**
- * Generates a checksum for the query payload
+ * Generate a checksum for the query
  */
-const generateChecksum = (payload: any): string => {
-  const str = JSON.stringify(payload);
+const generateChecksum = (ops: Operation[]): string => {
+  const str = JSON.stringify(ops);
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
     hash = ((hash << 5) - hash) + char;
-    hash = hash & hash; // Convert to 32-bit integer
+    hash = hash & hash;
   }
-  return Math.abs(hash).toString(16);
+  return Math.abs(hash).toString(16).padStart(8, '0');
 };
 
 /**
- * Converts visual graph to Rust IPC payload
+ * Convert graph to Rust IPC payload
  */
-const graphToRustPayload = (graph: QueryGraph): RustPayload => {
-  const operations = graph.nodes.map((node) => ({
-    type: node.type,
-    config: Object.entries(node.config).reduce((acc, [key, value]) => ({
-      ...acc,
-      [key]: typeof value === 'string' ? sanitizeInput(value) : value,
-    }), {}),
-  }));
+const graphToPayload = (graph: QueryGraph): RustPayload => {
+  const operations: Operation[] = [];
+  const sortedNodes = [...graph.nodes].sort((a, b) => a.position.x - b.position.x);
   
-  const payload = {
-    query_type: 'polars_lazy' as const,
+  for (const node of sortedNodes) {
+    const op: Operation = { op: node.type, params: {} };
+    
+    switch (node.type) {
+      case 'source':
+        op.params.table = sanitizeInput(String(node.config.table || ''));
+        op.params.columns = Array.isArray(node.config.columns) 
+          ? node.config.columns.map((c: string) => sanitizeInput(c))
+          : ['*'];
+        break;
+      case 'filter':
+        op.params.column = sanitizeInput(String(node.config.column || ''));
+        op.params.operator = ['=', '!=', '>', '<', '>=', '<=', 'LIKE'].includes(String(node.config.operator))
+          ? String(node.config.operator)
+          : '=';
+        op.params.value = sanitizeInput(String(node.config.value || ''));
+        break;
+      case 'aggregate':
+        op.params.function = ['SUM', 'AVG', 'COUNT', 'MIN', 'MAX'].includes(String(node.config.function))
+          ? String(node.config.function)
+          : 'SUM';
+        op.params.column = sanitizeInput(String(node.config.column || ''));
+        op.params.groupBy = Array.isArray(node.config.groupBy)
+          ? node.config.groupBy.map((c: string) => sanitizeInput(c))
+          : [];
+        break;
+      case 'transform':
+        op.params.expression = sanitizeInput(String(node.config.expression || ''));
+        op.params.alias = sanitizeInput(String(node.config.alias || 'result'));
+        break;
+      case 'output':
+        op.params.format = ['parquet', 'csv', 'json'].includes(String(node.config.format))
+          ? String(node.config.format)
+          : 'parquet';
+        op.params.path = sanitizeInput(String(node.config.path || '/tmp/output'));
+        break;
+    }
+    
+    operations.push(op);
+  }
+  
+  return {
+    query_type: 'polars',
     operations,
     sanitized: true,
-    checksum: '',
+    checksum: generateChecksum(operations),
   };
-  
-  payload.checksum = generateChecksum(payload);
-  
-  return payload;
 };
-
-// ============================================================================
-// Sub-Components
-// ============================================================================
 
 /**
- * Individual Query Node Component
+ * QueryBuilder Component
  */
-interface QueryNodeCardProps {
-  node: QueryNode;
-  isSelected: boolean;
-  onSelect: (id: string) => void;
-  onUpdate: (id: string, updates: Partial<QueryNode>) => void;
-  onDelete: (id: string) => void;
-}
-
-const QueryNodeCard: React.FC<QueryNodeCardProps> = ({
-  node,
-  isSelected,
-  onSelect,
-  onUpdate,
-  onDelete,
-}) => {
-  const nodeConfig = NODE_TYPES[node.type];
-  
-  return (
-    <div
-      className={`absolute p-3 rounded-lg border backdrop-blur-md cursor-move select-none ${
-        isSelected ? 'ring-2 ring-cyan-500' : ''
-      }`}
-      style={{
-        left: node.position.x,
-        top: node.position.y,
-        backgroundColor: `${nodeConfig.color}11`,
-        borderColor: nodeConfig.color,
-        minWidth: '180px',
-        boxShadow: isSelected ? `0 0 20px ${nodeConfig.color}44` : 'none',
-      }}
-      onClick={() => onSelect(node.id)}
-      role="button"
-      aria-label={`${nodeConfig.label} node: ${node.label}`}
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <span className="text-lg">{nodeConfig.icon}</span>
-          <span className="text-xs font-mono font-bold" style={{ color: nodeConfig.color }}>
-            {nodeConfig.label}
-          </span>
-        </div>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete(node.id);
-          }}
-          className="w-4 h-4 rounded text-gray-500 hover:text-red-400 hover:bg-red-500/20 flex items-center justify-center text-xs"
-          aria-label="Delete node"
-        >
-          ✕
-        </button>
-      </div>
-      
-      {/* Node Label */}
-      <input
-        type="text"
-        value={node.label}
-        onChange={(e) => onUpdate(node.id, { label: e.target.value })}
-        onClick={(e) => e.stopPropagation()}
-        className="w-full bg-transparent border-b border-white/20 text-white text-sm py-1 focus:outline-none focus:border-cyan-500 font-mono"
-        placeholder="Node label"
-      />
-      
-      {/* Config Fields */}
-      <div className="mt-2 space-y-1">
-        {node.type === 'filter' && (
-          <>
-            <input
-              type="text"
-              value={node.config.column || ''}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, column: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-              placeholder="Column name"
-            />
-            <select
-              value={node.config.operator || '='}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, operator: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-            >
-              <option value="=">=</option>
-              <option value=">">&gt;</option>
-              <option value="<">&lt;</option>
-              <option value=">=">&gt;=</option>
-              <option value="<=">&lt;=</option>
-              <option value="!=">≠</option>
-            </select>
-            <input
-              type="text"
-              value={node.config.value || ''}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, value: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-              placeholder="Value"
-            />
-          </>
-        )}
-        
-        {node.type === 'aggregate' && (
-          <>
-            <select
-              value={node.config.function || 'sum'}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, function: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-            >
-              <option value="sum">SUM</option>
-              <option value="avg">AVG</option>
-              <option value="count">COUNT</option>
-              <option value="min">MIN</option>
-              <option value="max">MAX</option>
-            </select>
-            <input
-              type="text"
-              value={node.config.column || ''}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, column: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-              placeholder="Column"
-            />
-          </>
-        )}
-        
-        {node.type === 'sort' && (
-          <>
-            <input
-              type="text"
-              value={node.config.column || ''}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, column: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-              placeholder="Sort column"
-            />
-            <select
-              value={node.config.order || 'asc'}
-              onChange={(e) => onUpdate(node.id, { config: { ...node.config, order: e.target.value } })}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-xs font-mono text-white focus:outline-none focus:border-cyan-500"
-            >
-              <option value="asc">Ascending ↑</option>
-              <option value="desc">Descending ↓</option>
-            </select>
-          </>
-        )}
-      </div>
-      
-      {/* Connection Points */}
-      <div className="absolute -left-1 top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-cyan-500 border-2 border-[#0a0a12]" />
-      <div className="absolute -right-1 top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-cyan-500 border-2 border-[#0a0a12]" />
-    </div>
-  );
-};
-
-// ============================================================================
-// Main Component
-// ============================================================================
-
-export const QueryBuilder: React.FC<QueryBuilderProps> = ({
-  initialGraph,
-  onExecute,
-}) => {
-  const [graph, setGraph] = useState<QueryGraph>(initialGraph || {
-    nodes: [
-      {
-        id: generateId(),
-        type: 'source',
-        position: { x: 50, y: 200 },
-        config: { table: 'trades' },
-        label: 'Trade Data',
-      },
-      {
-        id: generateId(),
-        type: 'output',
-        position: { x: 550, y: 200 },
-        config: {},
-        label: 'Result',
-      },
-    ],
-    connections: [],
-  });
-  
+export const QueryBuilder: React.FC<Props> = ({ onGenerate }) => {
+  const [graph, setGraph] = useState<QueryGraph>({ nodes: [], edges: [] });
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
-  const canvasRef = useRef<HTMLDivElement>(null);
-  const dragOffset = useRef({ x: 0, y: 0 });
+  const [preview, setPreview] = useState<RustPayload | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
-  /**
-   * Adds a new node to the graph
-   */
-  const addNode = useCallback((type: NodeType) => {
-    const newNode: QueryNode = {
-      id: generateId(),
+  const addNode = useCallback((type: Node['type']) => {
+    const newNode: Node = {
+      id: `node_${Date.now()}`,
       type,
-      position: { x: 200 + Math.random() * 200, y: 100 + Math.random() * 200 },
+      position: { x: 100 + graph.nodes.length * 150, y: 200 },
       config: {},
-      label: NODE_TYPES[type].label,
     };
-    
     setGraph((prev) => ({
       nodes: [...prev.nodes, newNode],
-      connections: prev.connections,
+      edges: prev.edges,
+    }));
+    setSelectedNode(newNode.id);
+  }, [graph.nodes.length]);
+
+  const updateNodeConfig = useCallback((nodeId: string, config: Record<string, unknown>) => {
+    setGraph((prev) => ({
+      nodes: prev.nodes.map((n) =>
+        n.id === nodeId ? { ...n, config: { ...n.config, ...config } } : n
+      ),
+      edges: prev.edges,
     }));
   }, []);
 
-  /**
-   * Updates a node's properties
-   */
-  const updateNode = useCallback((id: string, updates: Partial<QueryNode>) => {
+  const deleteNode = useCallback((nodeId: string) => {
     setGraph((prev) => ({
-      nodes: prev.nodes.map((node) =>
-        node.id === id ? { ...node, ...updates } : node
-      ),
-      connections: prev.connections,
+      nodes: prev.nodes.filter((n) => n.id !== nodeId),
+      edges: prev.edges.filter((e) => e.source !== nodeId && e.target !== nodeId),
     }));
-  }, []);
-
-  /**
-   * Deletes a node from the graph
-   */
-  const deleteNode = useCallback((id: string) => {
-    setGraph((prev) => ({
-      nodes: prev.nodes.filter((node) => node.id !== id),
-      connections: prev.connections.filter(
-        (conn) => conn.from !== id && conn.to !== id
-      ),
-    }));
-    if (selectedNode === id) {
-      setSelectedNode(null);
-    }
+    if (selectedNode === nodeId) setSelectedNode(null);
   }, [selectedNode]);
 
-  /**
-   * Handles node drag start
-   */
-  const handleNodeSelect = useCallback((id: string) => {
-    setSelectedNode(id);
-  }, []);
+  const handleGenerate = useCallback(() => {
+    try {
+      const payload = graphToPayload(graph);
+      setPreview(payload);
+      setValidationError(null);
+      onGenerate?.(payload);
+    } catch (error) {
+      setValidationError('Failed to generate query payload');
+    }
+  }, [graph, onGenerate]);
 
-  /**
-   * Executes the query and sends to Rust backend
-   */
-  const executeQuery = useCallback(() => {
-    const payload = graphToRustPayload(graph);
-    console.log('Executing query:', payload);
-    onExecute?.(payload);
-  }, [graph, onExecute]);
-
-  // Generate SVG path for connections
-  const connectionPaths = useMemo(() => {
-    return graph.connections.map((conn) => {
-      const fromNode = graph.nodes.find((n) => n.id === conn.from);
-      const toNode = graph.nodes.find((n) => n.id === conn.to);
-      
-      if (!fromNode || !toNode) return null;
-      
-      const startX = fromNode.position.x + 180; // Right side of from node
-      const startY = fromNode.position.y + 50; // Middle of from node
-      const endX = toNode.position.x; // Left side of to node
-      const endY = toNode.position.y + 50; // Middle of to node
-      
-      // Bezier curve
-      const controlOffset = Math.abs(endX - startX) * 0.5;
-      const path = `M ${startX} ${startY} C ${startX + controlOffset} ${startY}, ${endX - controlOffset} ${endY}, ${endX} ${endY}`;
-      
-      return (
-        <path
-          key={`${conn.from}-${conn.to}`}
-          d={path}
-          fill="none"
-          stroke="#00ffff"
-          strokeWidth="2"
-          strokeDasharray="5,5"
-          className="animate-pulse"
-        />
-      );
-    });
-  }, [graph]);
+  const selectedNodeData = useMemo(
+    () => graph.nodes.find((n) => n.id === selectedNode),
+    [graph.nodes, selectedNode]
+  );
 
   return (
-    <div className="w-full rounded-xl overflow-hidden bg-[#0a0a12]/90 backdrop-blur-sm border border-cyan-900/30">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-b from-[#0a0a12] to-transparent border-b border-white/5">
-        <h3 className="text-cyan-400 font-mono text-sm tracking-wider uppercase">
-          🔧 Query Builder <span className="text-xs opacity-70">| Polars/DuckDB</span>
-        </h3>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={executeQuery}
-            className="px-4 py-1.5 bg-cyan-500/20 border border-cyan-500/50 rounded text-cyan-400 text-xs font-mono hover:bg-cyan-500/30 transition-colors"
-          >
-            ▶ Execute
-          </button>
+    <div className="p-4 bg-black/80 backdrop-blur-md border border-cyan-900/50 rounded-xl h-full flex flex-col">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-sm font-mono font-bold text-white tracking-wider">QUERY_BUILDER_V4</h3>
+        <button
+          onClick={handleGenerate}
+          disabled={graph.nodes.length === 0}
+          className="px-4 py-1.5 text-xs font-mono font-bold bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 text-white rounded transition-colors"
+        >
+          GENERATE_PAYLOAD
+        </button>
+      </div>
+
+      <div className="flex-1 flex gap-4 overflow-hidden">
+        <div className="w-48 flex-shrink-0 p-3 bg-gray-900/50 rounded-lg border border-gray-800">
+          <div className="text-[10px] font-mono text-gray-500 mb-2">NODE_PALETTE</div>
+          <div className="space-y-2">
+            {Object.entries(NODE_TYPES).map(([type, config]) => (
+              <button
+                key={type}
+                onClick={() => addNode(type as Node['type'])}
+                className="w-full flex items-center gap-2 px-2 py-2 rounded border border-gray-700 hover:border-cyan-500 transition-colors group"
+              >
+                <span className="text-lg">{config.icon}</span>
+                <span className="text-[10px] font-mono text-gray-400 group-hover:text-cyan-400">{config.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex-1 relative bg-gray-900/30 rounded-lg border border-gray-800 overflow-auto">
+          {graph.nodes.length === 0 ? (
+            <div className="absolute inset-0 flex items-center justify-center text-gray-500">
+              <div className="text-center">
+                <div className="text-3xl mb-2">📐</div>
+                <div className="text-[10px] font-mono">DRAG NODES FROM PALETTE</div>
+              </div>
+            </div>
+          ) : (
+            <div className="p-8 min-w-max min-h-max">
+              {graph.nodes.map((node) => {
+                const config = NODE_TYPES[node.type];
+                const isSelected = selectedNode === node.id;
+                return (
+                  <div
+                    key={node.id}
+                    onClick={() => setSelectedNode(node.id)}
+                    className={`absolute p-3 rounded-lg border cursor-pointer transition-all ${isSelected ? 'ring-2 ring-cyan-500 scale-105' : ''}`}
+                    style={{
+                      left: node.position.x,
+                      top: node.position.y,
+                      backgroundColor: COLORS.panel,
+                      borderColor: isSelected ? config.color : COLORS.border,
+                      boxShadow: `0 0 10px ${config.color}20`,
+                    }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-lg">{config.icon}</span>
+                      <span className="text-[10px] font-mono font-bold" style={{ color: config.color }}>{config.label}</span>
+                    </div>
+                    <div className="text-[9px] font-mono text-gray-500">
+                      {Object.keys(node.config).length > 0
+                        ? Object.entries(node.config).slice(0, 2).map(([k, v]) => `${k}: ${v}`).join(', ')
+                        : '(unconfigured)'}
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteNode(node.id);
+                      }}
+                      className="absolute -top-2 -right-2 w-5 h-5 bg-red-900/80 hover:bg-red-700 rounded-full text-[10px] text-white flex items-center justify-center"
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="w-64 flex-shrink-0 p-3 bg-gray-900/50 rounded-lg border border-gray-800 overflow-y-auto">
+          <div className="text-[10px] font-mono text-gray-500 mb-2">NODE_CONFIG</div>
+          {selectedNodeData ? (
+            <div className="space-y-3">
+              <div className="text-xs font-mono font-bold text-white mb-2">{NODE_TYPES[selectedNodeData.type].label}</div>
+              
+              {selectedNodeData.type === 'source' && (
+                <>
+                  <input type="text" placeholder="Table name" value={String(selectedNodeData.config.table || '')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { table: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                  <input type="text" placeholder="Columns (comma-separated)"
+                    value={Array.isArray(selectedNodeData.config.columns) ? selectedNodeData.config.columns.join(', ') : ''}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { columns: e.target.value.split(',').map((c) => c.trim()) })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                </>
+              )}
+              
+              {selectedNodeData.type === 'filter' && (
+                <>
+                  <input type="text" placeholder="Column" value={String(selectedNodeData.config.column || '')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { column: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                  <select value={String(selectedNodeData.config.operator || '=')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { operator: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none">
+                    <option value="=">=</option><option value="!=">!=</option><option value=">">&gt;</option>
+                    <option value="<">&lt;</option><option value=">=">&gt;=</option><option value="<=">&lt;=</option>
+                  </select>
+                  <input type="text" placeholder="Value" value={String(selectedNodeData.config.value || '')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { value: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                </>
+              )}
+
+              {selectedNodeData.type === 'aggregate' && (
+                <>
+                  <select value={String(selectedNodeData.config.function || 'SUM')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { function: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none">
+                    <option value="SUM">SUM</option><option value="AVG">AVG</option><option value="COUNT">COUNT</option>
+                    <option value="MIN">MIN</option><option value="MAX">MAX</option>
+                  </select>
+                  <input type="text" placeholder="Column" value={String(selectedNodeData.config.column || '')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { column: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                </>
+              )}
+
+              {selectedNodeData.type === 'output' && (
+                <>
+                  <select value={String(selectedNodeData.config.format || 'parquet')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { format: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none">
+                    <option value="parquet">Parquet</option><option value="csv">CSV</option><option value="json">JSON</option>
+                  </select>
+                  <input type="text" placeholder="Output path" value={String(selectedNodeData.config.path || '')}
+                    onChange={(e) => updateNodeConfig(selectedNodeData.id, { path: e.target.value })}
+                    className="w-full px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none" />
+                </>
+              )}
+
+              <button onClick={() => deleteNode(selectedNodeData.id)}
+                className="w-full mt-4 px-2 py-1 bg-red-900/50 hover:bg-red-800 border border-red-700 rounded text-xs font-mono text-red-400 transition-colors">
+                DELETE_NODE
+              </button>
+            </div>
+          ) : (
+            <div className="text-[10px] font-mono text-gray-600 text-center py-8">SELECT A NODE TO CONFIGURE</div>
+          )}
         </div>
       </div>
 
-      {/* Toolbar */}
-      <div className="flex items-center gap-2 px-4 py-2 bg-white/5 border-b border-white/10 flex-wrap">
-        <span className="text-xs text-gray-400 font-mono mr-2">Add Node:</span>
-        {(Object.keys(NODE_TYPES) as NodeType[]).map((type) => (
-          <button
-            key={type}
-            onClick={() => addNode(type)}
-            className="px-2 py-1 rounded border border-white/20 text-xs font-mono hover:border-cyan-500 hover:text-cyan-400 transition-colors"
-            style={{ color: NODE_TYPES[type].color }}
-          >
-            {NODE_TYPES[type].icon} {NODE_TYPES[type].label}
-          </button>
-        ))}
-      </div>
-
-      {/* Canvas */}
-      <div
-        ref={canvasRef}
-        className="relative overflow-hidden"
-        style={{ height: CANVAS_SIZE.height }}
-        onClick={() => setSelectedNode(null)}
-      >
-        {/* Grid Background */}
-        <div
-          className="absolute inset-0 opacity-10"
-          style={{
-            backgroundImage: 'linear-gradient(#ffffff 1px, transparent 1px), linear-gradient(90deg, #ffffff 1px, transparent 1px)',
-            backgroundSize: '20px 20px',
-          }}
-        />
-
-        {/* Connection Lines SVG */}
-        <svg className="absolute inset-0 w-full h-full pointer-events-none">
-          {connectionPaths}
-        </svg>
-
-        {/* Nodes */}
-        {graph.nodes.map((node) => (
-          <QueryNodeCard
-            key={node.id}
-            node={node}
-            isSelected={selectedNode === node.id}
-            onSelect={handleNodeSelect}
-            onUpdate={updateNode}
-            onDelete={deleteNode}
-          />
-        ))}
-      </div>
-
-      {/* Footer */}
-      <div className="px-4 py-2 bg-gradient-to-t from-[#0a0a12] to-transparent border-t border-white/5">
-        <div className="flex items-center justify-between text-xs font-mono text-gray-500">
-          <span>{graph.nodes.length} nodes | {graph.connections.length} connections</span>
-          <span className="text-green-400">✓ Input Sanitized</span>
+      {preview && (
+        <div className="mt-4 p-3 bg-gray-900/80 rounded-lg border border-cyan-900/50">
+          <div className="flex justify-between items-center mb-2">
+            <div className="text-[10px] font-mono text-cyan-400">RUST_IPC_PAYLOAD_PREVIEW</div>
+            <div className="text-[9px] font-mono text-gray-500">CHECKSUM: {preview.checksum}</div>
+          </div>
+          <pre className="text-[9px] font-mono text-gray-300 overflow-x-auto whitespace-pre-wrap">{JSON.stringify(preview, null, 2)}</pre>
         </div>
-      </div>
+      )}
+
+      {validationError && (
+        <div className="mt-2 px-3 py-2 bg-red-900/30 border border-red-700 rounded text-[10px] font-mono text-red-400">⚠️ {validationError}</div>
+      )}
     </div>
   );
 };

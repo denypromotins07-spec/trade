@@ -1,527 +1,322 @@
 /**
- * ExportManager.tsx - Data Exploration: Parquet/CSV Export Manager
+ * File 12: ExportManager.tsx
+ * Chapter 4: Data Exploration & Custom Query Builder
  * 
- * Manages Parquet and CSV exports with a cyberpunk-styled progress ring
+ * Parquet and CSV export manager featuring a cyberpunk-styled progress ring
  * that tracks the Rust backend's asynchronous NVMe disk writes.
- * 
- * Features:
- * - Multi-format export (Parquet, CSV, JSON)
- * - Real-time progress tracking via Rust IPC
- * - Cyberpunk progress ring animation
- * - Batch export queue management
- * - NVMe write speed visualization
  */
 
-'use client';
-
-import React, { useState, useCallback, useEffect, useRef } from 'react';
-
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
-type ExportFormat = 'parquet' | 'csv' | 'json';
-type ExportStatus = 'pending' | 'writing' | 'complete' | 'error';
+import React, { useState, useCallback, useEffect } from 'react';
 
 interface ExportJob {
   id: string;
   name: string;
-  format: ExportFormat;
-  status: ExportStatus;
+  format: 'parquet' | 'csv' | 'json';
+  status: 'pending' | 'writing' | 'complete' | 'error';
   progress: number; // 0-100
-  totalRows: number;
-  writtenRows: number;
-  writeSpeedMBps: number;
+  rows: number;
+  sizeBytes?: number;
+  writeSpeedMBps?: number;
   error?: string;
-  createdAt: number;
-  completedAt?: number;
 }
 
-interface ExportManagerProps {
+interface Props {
+  onExport?: (job: ExportJob) => void;
   maxConcurrent?: number;
-  onExportStart?: (job: ExportJob) => void;
-  onExportComplete?: (job: ExportJob) => void;
 }
 
-// ============================================================================
-// Constants & Configuration
-// ============================================================================
-
-const MAX_CONCURRENT_DEFAULT = 3;
-const RING_SIZE = 120;
-const STROKE_WIDTH = 8;
-
-const FORMAT_CONFIG: Record<ExportFormat, { icon: string; color: string; label: string; extension: string }> = {
-  parquet: { icon: '📦', color: '#ff6600', label: 'Parquet', extension: '.parquet' },
-  csv: { icon: '📄', color: '#00ff88', label: 'CSV', extension: '.csv' },
-  json: { icon: '{}', color: '#00ccff', label: 'JSON', extension: '.json' },
-};
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/**
- * Generates a unique ID for export jobs
- */
-const generateId = (): string => {
-  return `export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const COLORS = {
+  bg: '#0a0a0a',
+  panel: 'rgba(20, 20, 30, 0.8)',
+  border: '#333333',
+  text: '#c0c0c0',
+  cyan: '#00f3ff',
+  green: '#00ff9d',
+  orange: '#ffaa00',
+  red: '#ff0055',
+  purple: '#bd00ff',
 };
 
 /**
- * Formats file size in human-readable format
+ * Format bytes to human readable
  */
-const formatSize = (bytes: number): string => {
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let unitIndex = 0;
-  let size = bytes;
-  
-  while (size >= 1024 && unitIndex < units.length - 1) {
-    size /= 1024;
-    unitIndex++;
+const formatBytes = (bytes?: number): string => {
+  if (!bytes) return 'N/A';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  let num = bytes;
+  while (num >= 1024 && i < units.length - 1) {
+    num /= 1024;
+    i++;
   }
-  
-  return `${size.toFixed(1)} ${units[unitIndex]}`;
+  return `${num.toFixed(2)} ${units[i]}`;
 };
-
-/**
- * Formats duration in human-readable format
- */
-const formatDuration = (ms: number): string => {
-  if (ms < 1000) return `${ms}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
-};
-
-// ============================================================================
-// Sub-Components
-// ============================================================================
 
 /**
  * Cyberpunk Progress Ring Component
  */
-interface ProgressRingProps {
+const ProgressRing: React.FC<{
   progress: number;
   size?: number;
   strokeWidth?: number;
   color?: string;
-  showLabel?: boolean;
-  label?: string;
-}
-
-const ProgressRing: React.FC<ProgressRingProps> = ({
-  progress,
-  size = RING_SIZE,
-  strokeWidth = STROKE_WIDTH,
-  color = '#00ff88',
-  showLabel = true,
-  label,
-}) => {
+}> = ({ progress, size = 60, strokeWidth = 4, color = COLORS.cyan }) => {
   const radius = (size - strokeWidth) / 2;
-  const circumference = radius * 2 * Math.PI;
-  const offset = circumference - (progress / 100) * circumference;
-  
-  const center = size / 2;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - progress / 100);
 
   return (
-    <div className="relative inline-flex items-center justify-center">
+    <div className="relative" style={{ width: size, height: size }}>
       <svg
         width={size}
         height={size}
         className="transform -rotate-90"
-        aria-label={`Progress: ${progress}%`}
       >
-        {/* Background circle */}
+        {/* Background ring */}
         <circle
-          cx={center}
-          cy={center}
+          cx={size / 2}
+          cy={size / 2}
           r={radius}
           fill="none"
-          stroke="#1a1a2e"
+          stroke="#222"
           strokeWidth={strokeWidth}
         />
-        
-        {/* Progress circle with gradient */}
-        <defs>
-          <linearGradient id={`gradient-${color}`} x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stopColor={color} />
-            <stop offset="100%" stopColor={`${color}88`} />
-          </linearGradient>
-          
-          <filter id={`glow-${color.replace('#', '')}`}>
-            <feGaussianBlur stdDeviation="3" result="coloredBlur" />
-            <feMerge>
-              <feMergeNode in="coloredBlur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-        </defs>
-        
+        {/* Progress ring */}
         <circle
-          cx={center}
-          cy={center}
+          cx={size / 2}
+          cy={size / 2}
           r={radius}
           fill="none"
-          stroke={`url(#gradient-${color})`}
+          stroke={color}
           strokeWidth={strokeWidth}
-          strokeLinecap="round"
           strokeDasharray={circumference}
           strokeDashoffset={offset}
-          filter={`url(#glow-${color.replace('#', '')})`}
-          className="transition-all duration-300 ease-out"
+          strokeLinecap="round"
+          style={{
+            transition: 'stroke-dashoffset 0.3s ease-out',
+            filter: `drop-shadow(0 0 4px ${color})`,
+          }}
         />
-        
-        {/* Animated segments for cyberpunk effect */}
-        {progress < 100 && (
-          <circle
-            cx={center}
-            cy={center}
-            r={radius}
-            fill="none"
-            stroke={color}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-            strokeDasharray={`${circumference * 0.1}, ${circumference}`}
-            strokeDashoffset={offset - circumference * 0.5}
-            className="animate-spin"
-            style={{ animationDuration: '2s' }}
-          />
-        )}
       </svg>
-      
-      {/* Center Label */}
-      {showLabel && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <span className="text-lg font-mono font-bold" style={{ color }}>
-            {Math.round(progress)}%
-          </span>
-          {label && (
-            <span className="text-xs text-gray-400 font-mono mt-0.5">{label}</span>
-          )}
-        </div>
-      )}
+      {/* Center percentage */}
+      <div className="absolute inset-0 flex items-center justify-center">
+        <span className="text-[10px] font-mono font-bold text-white">
+          {Math.round(progress)}%
+        </span>
+      </div>
     </div>
   );
 };
 
 /**
- * Individual Export Job Card
+ * ExportManager Component
  */
-interface ExportJobCardProps {
-  job: ExportJob;
-  onCancel: (id: string) => void;
-  onRetry: (id: string) => void;
-}
-
-const ExportJobCard: React.FC<ExportJobCardProps> = ({ job, onCancel, onRetry }) => {
-  const config = FORMAT_CONFIG[job.format];
-  const isComplete = job.status === 'complete';
-  const isError = job.status === 'error';
-  const isWriting = job.status === 'writing';
-  
-  const duration = job.completedAt
-    ? formatDuration(job.completedAt - job.createdAt)
-    : formatDuration(Date.now() - job.createdAt);
-
-  return (
-    <div
-      className={`p-4 rounded-lg border transition-all ${
-        isError ? 'border-red-500/50 bg-red-500/10' : 'border-white/10 bg-white/5'
-      }`}
-    >
-      <div className="flex items-center gap-4">
-        {/* Progress Ring */}
-        <ProgressRing
-          progress={isError ? 0 : job.progress}
-          color={isError ? '#ff0044' : config.color}
-          size={60}
-          strokeWidth={4}
-          showLabel={true}
-        />
-        
-        {/* Job Info */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-lg">{config.icon}</span>
-            <span className="font-mono text-sm text-white truncate">{job.name}</span>
-            <span className="text-xs px-1.5 py-0.5 rounded font-mono" style={{ backgroundColor: config.color, color: '#000' }}>
-              {config.label}
-            </span>
-          </div>
-          
-          <div className="grid grid-cols-3 gap-2 text-xs font-mono text-gray-400">
-            <div>
-              <span className="text-gray-500">Rows:</span>{' '}
-              <span className="text-white">{job.writtenRows.toLocaleString()}/{job.totalRows.toLocaleString()}</span>
-            </div>
-            <div>
-              <span className="text-gray-500">Speed:</span>{' '}
-              <span className={isWriting ? 'text-cyan-400' : 'text-gray-400'}>
-                {job.writeSpeedMBps.toFixed(1)} MB/s
-              </span>
-            </div>
-            <div>
-              <span className="text-gray-500">Time:</span>{' '}
-              <span className="text-white">{duration}</span>
-            </div>
-          </div>
-          
-          {/* Status Bar */}
-          <div className="mt-2 flex items-center gap-2">
-            {isWriting && (
-              <>
-                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                <span className="text-xs text-cyan-400 font-mono">Writing to NVMe...</span>
-              </>
-            )}
-            {isComplete && (
-              <>
-                <span className="w-2 h-2 rounded-full bg-green-400" />
-                <span className="text-xs text-green-400 font-mono">Complete</span>
-              </>
-            )}
-            {isError && (
-              <>
-                <span className="w-2 h-2 rounded-full bg-red-400" />
-                <span className="text-xs text-red-400 font-mono">{job.error || 'Failed'}</span>
-              </>
-            )}
-          </div>
-        </div>
-        
-        {/* Actions */}
-        <div className="flex flex-col gap-2">
-          {isWriting && (
-            <button
-              onClick={() => onCancel(job.id)}
-              className="px-3 py-1.5 text-xs font-mono rounded border border-red-500/50 text-red-400 hover:bg-red-500/20 transition-colors"
-            >
-              Cancel
-            </button>
-          )}
-          {isError && (
-            <button
-              onClick={() => onRetry(job.id)}
-              className="px-3 py-1.5 text-xs font-mono rounded border border-cyan-500/50 text-cyan-400 hover:bg-cyan-500/20 transition-colors"
-            >
-              Retry
-            </button>
-          )}
-          {isComplete && (
-            <a
-              href="#"
-              className="px-3 py-1.5 text-xs font-mono rounded border border-green-500/50 text-green-400 hover:bg-green-500/20 transition-colors text-center"
-            >
-              Download
-            </a>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ============================================================================
-// Main Component
-// ============================================================================
-
-export const ExportManager: React.FC<ExportManagerProps> = ({
-  maxConcurrent = MAX_CONCURRENT_DEFAULT,
-  onExportStart,
-  onExportComplete,
-}) => {
+export const ExportManager: React.FC<Props> = ({ onExport, maxConcurrent = 3 }) => {
   const [jobs, setJobs] = useState<ExportJob[]>([]);
-  const [selectedFormat, setSelectedFormat] = useState<ExportFormat>('parquet');
-  const [exportName, setExportName] = useState('');
-  
-  /**
-   * Creates a new export job
-   */
-  const createExport = useCallback(() => {
+  const [selectedFormat, setSelectedFormat] = useState<'parquet' | 'csv' | 'json'>('parquet');
+  const [fileName, setFileName] = useState('export_data');
+
+  // Simulate export progress (in real app, this would be WebSocket updates from Rust)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setJobs((prev) =>
+        prev.map((job) => {
+          if (job.status === 'writing') {
+            const newProgress = Math.min(job.progress + Math.random() * 15, 100);
+            const isComplete = newProgress >= 100;
+            
+            return {
+              ...job,
+              progress: newProgress,
+              status: isComplete ? 'complete' : 'writing',
+              writeSpeedMBps: isComplete ? job.writeSpeedMBps : 500 + Math.random() * 2000, // Simulate NVMe speeds
+              sizeBytes: isComplete ? job.rows * 100 : undefined,
+            };
+          }
+          return job;
+        })
+      );
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleExport = useCallback(() => {
     const newJob: ExportJob = {
-      id: generateId(),
-      name: exportName || `export-${Date.now()}`,
+      id: `job_${Date.now()}`,
+      name: `${fileName}.${selectedFormat}`,
       format: selectedFormat,
       status: 'pending',
       progress: 0,
-      totalRows: Math.floor(Math.random() * 1000000) + 10000,
-      writtenRows: 0,
-      writeSpeedMBps: 0,
-      createdAt: Date.now(),
+      rows: Math.floor(Math.random() * 1000000) + 10000, // Simulated row count
     };
-    
-    setJobs((prev) => [newJob, ...prev]);
-    onExportStart?.(newJob);
-    setExportName('');
-    
-    // Simulate export progress (in production, this would be driven by Rust backend IPC)
-    simulateExportProgress(newJob.id);
-  }, [exportName, selectedFormat, onExportStart]);
-  
-  /**
-   * Simulates export progress from Rust backend
-   */
-  const simulateExportProgress = useCallback((jobId: string) => {
-    let progress = 0;
-    const interval = setInterval(() => {
-      progress += Math.random() * 5 + 2;
-      
-      if (progress >= 100) {
-        progress = 100;
-        clearInterval(interval);
-        
-        setJobs((prev) =>
-          prev.map((job) =>
-            job.id === jobId
-              ? {
-                  ...job,
-                  status: 'complete',
-                  progress: 100,
-                  writtenRows: job.totalRows,
-                  writeSpeedMBps: Math.random() * 500 + 200, // Simulated NVMe speed
-                  completedAt: Date.now(),
-                }
-              : job
-          )
-        );
-        
-        const completedJob = jobs.find((j) => j.id === jobId);
-        if (completedJob) {
-          onExportComplete?.(completedJob);
-        }
-      } else {
-        setJobs((prev) =>
-          prev.map((job) =>
-            job.id === jobId
-              ? {
-                  ...job,
-                  status: 'writing',
-                  progress,
-                  writtenRows: Math.floor((progress / 100) * job.totalRows),
-                  writeSpeedMBps: Math.random() * 500 + 200,
-                }
-              : job
-          )
-        );
-      }
-    }, 200);
-  }, [jobs, onExportComplete]);
-  
-  /**
-   * Cancels an export job
-   */
-  const cancelJob = useCallback((id: string) => {
-    setJobs((prev) =>
-      prev.map((job) =>
-        job.id === id ? { ...job, status: 'error', error: 'Cancelled by user' } : job
-      )
-    );
-  }, []);
-  
-  /**
-   * Retries a failed export job
-   */
-  const retryJob = useCallback((id: string) => {
-    setJobs((prev) =>
-      prev.map((job) =>
-        job.id === id
-          ? { ...job, status: 'pending', progress: 0, error: undefined }
-          : job
-      )
-    );
-    
-    // Restart progress simulation
-    setTimeout(() => simulateExportProgress(id), 100);
-  }, [simulateExportProgress]);
-  
-  // Statistics
-  const stats = useMemo(() => {
-    const total = jobs.length;
-    const complete = jobs.filter((j) => j.status === 'complete').length;
-    const writing = jobs.filter((j) => j.status === 'writing').length;
-    const error = jobs.filter((j) => j.status === 'error').length;
-    const totalRows = jobs.reduce((acc, j) => acc + j.writtenRows, 0);
-    
-    return { total, complete, writing, error, totalRows };
-  }, [jobs]);
+
+    // Start with pending, then move to writing after brief delay
+    setJobs((prev) => [...prev, newJob]);
+    onExport?.(newJob);
+
+    // Simulate starting the write
+    setTimeout(() => {
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === newJob.id ? { ...j, status: 'writing', progress: 5 } : j
+        )
+      );
+    }, 500);
+  }, [fileName, selectedFormat, onExport]);
+
+  const activeJobs = jobs.filter((j) => j.status === 'writing' || j.status === 'pending').length;
+  const canExport = activeJobs < maxConcurrent;
 
   return (
-    <div className="w-full rounded-xl overflow-hidden bg-[#0a0a12]/90 backdrop-blur-sm border border-cyan-900/30">
+    <div className="p-4 bg-black/80 backdrop-blur-md border border-cyan-900/50 rounded-xl">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 bg-gradient-to-b from-[#0a0a12] to-transparent border-b border-white/5">
-        <h3 className="text-cyan-400 font-mono text-sm tracking-wider uppercase">
-          💾 Export Manager <span className="text-xs opacity-70">| NVMe Write</span>
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-sm font-mono font-bold text-white tracking-wider">
+          EXPORT_MANAGER_V4
         </h3>
-        <div className="flex items-center gap-3 text-xs font-mono">
-          <span className="text-gray-400">Active: {stats.writing}</span>
-          <span className="text-green-400">Complete: {stats.complete}</span>
+        <div className="text-[10px] font-mono text-gray-500">
+          MAX_CONCURRENT: {maxConcurrent}
         </div>
       </div>
 
-      {/* New Export Form */}
-      <div className="p-4 border-b border-white/10">
-        <div className="flex items-center gap-3 flex-wrap">
+      {/* Export Controls */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="col-span-2">
+          <label className="text-[9px] font-mono text-gray-500 block mb-1">FILE_NAME</label>
           <input
             type="text"
-            value={exportName}
-            onChange={(e) => setExportName(e.target.value)}
-            placeholder="Export name..."
-            className="flex-1 min-w-[200px] bg-white/10 border border-white/20 rounded px-3 py-2 text-sm font-mono text-white focus:outline-none focus:border-cyan-500"
+            value={fileName}
+            onChange={(e) => setFileName(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none"
+            placeholder="output_file"
           />
-          
-          <div className="flex items-center gap-2">
-            {(Object.keys(FORMAT_CONFIG) as ExportFormat[]).map((format) => (
-              <button
-                key={format}
-                onClick={() => setSelectedFormat(format)}
-                className={`px-3 py-2 rounded border transition-all flex items-center gap-2 ${
-                  selectedFormat === format
-                    ? 'border-cyan-500 bg-cyan-500/20 text-cyan-400'
-                    : 'border-white/20 bg-white/5 text-gray-400 hover:border-white/40'
-                }`}
-                style={{
-                  borderColor: selectedFormat === format ? FORMAT_CONFIG[format].color : undefined,
-                }}
-              >
-                <span>{FORMAT_CONFIG[format].icon}</span>
-                <span className="text-xs font-mono">{FORMAT_CONFIG[format].label}</span>
-              </button>
-            ))}
-          </div>
-          
-          <button
-            onClick={createExport}
-            disabled={!exportName.trim()}
-            className="px-4 py-2 bg-cyan-500/20 border border-cyan-500/50 rounded text-cyan-400 text-sm font-mono hover:bg-cyan-500/30 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        </div>
+        <div>
+          <label className="text-[9px] font-mono text-gray-500 block mb-1">FORMAT</label>
+          <select
+            value={selectedFormat}
+            onChange={(e) => setSelectedFormat(e.target.value as typeof selectedFormat)}
+            className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded text-xs font-mono text-white focus:border-cyan-500 focus:outline-none"
           >
-            Start Export
-          </button>
+            <option value="parquet">PARQUET</option>
+            <option value="csv">CSV</option>
+            <option value="json">JSON</option>
+          </select>
         </div>
       </div>
 
-      {/* Export Jobs List */}
-      <div className="p-4 space-y-3 max-h-[400px] overflow-y-auto">
+      <button
+        onClick={handleExport}
+        disabled={!canExport}
+        className={`w-full mb-4 px-4 py-2 text-xs font-mono font-bold rounded transition-all ${
+          canExport
+            ? 'bg-cyan-600 hover:bg-cyan-500 text-white'
+            : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+        }`}
+        style={canExport ? { boxShadow: '0 0 15px rgba(0,243,255,0.3)' } : {}}
+      >
+        {canExport ? 'START_EXPORT' : `MAX_JOBS (${maxConcurrent}) REACHED`}
+      </button>
+
+      {/* Active Jobs */}
+      <div className="space-y-3">
+        <div className="text-[9px] font-mono text-gray-500">ACTIVE_JOBS</div>
+        
         {jobs.length === 0 ? (
-          <div className="text-center py-8 text-gray-500 font-mono text-sm">
-            No export jobs. Create one to begin.
+          <div className="text-center py-8 text-gray-600 text-[10px] font-mono">
+            NO ACTIVE EXPORTS
           </div>
         ) : (
-          jobs.map((job) => (
-            <ExportJobCard
+          jobs.slice(-5).map((job) => (
+            <div
               key={job.id}
-              job={job}
-              onCancel={cancelJob}
-              onRetry={retryJob}
-            />
+              className="flex items-center gap-3 p-3 rounded-lg border bg-gray-900/50"
+              style={{
+                borderColor:
+                  job.status === 'complete'
+                    ? COLORS.green
+                    : job.status === 'error'
+                    ? COLORS.red
+                    : COLORS.border,
+              }}
+            >
+              {/* Progress Ring */}
+              <ProgressRing
+                progress={job.progress}
+                color={
+                  job.status === 'complete'
+                    ? COLORS.green
+                    : job.status === 'error'
+                    ? COLORS.red
+                    : COLORS.cyan
+                }
+              />
+
+              {/* Job Info */}
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="text-xs font-mono font-bold text-white truncate">
+                    {job.name}
+                  </span>
+                  <span
+                    className="text-[8px] px-1.5 py-0.5 rounded font-mono"
+                    style={{
+                      backgroundColor:
+                        job.status === 'complete'
+                          ? `${COLORS.green}20`
+                          : job.status === 'error'
+                          ? `${COLORS.red}20`
+                          : `${COLORS.cyan}20`,
+                      color:
+                        job.status === 'complete'
+                          ? COLORS.green
+                          : job.status === 'error'
+                          ? COLORS.red
+                          : COLORS.cyan,
+                    }}
+                  >
+                    {job.status.toUpperCase()}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-[9px] font-mono text-gray-400">
+                  <div>ROWS: {job.rows.toLocaleString()}</div>
+                  <div>SIZE: {formatBytes(job.sizeBytes)}</div>
+                  <div>NVMe: {job.writeSpeedMBps?.toFixed(0) || '--'} MB/s</div>
+                </div>
+              </div>
+
+              {/* Status Icon */}
+              {job.status === 'complete' && (
+                <span className="text-green-400 text-lg">✓</span>
+              )}
+              {job.status === 'error' && (
+                <span className="text-red-400 text-lg">✗</span>
+              )}
+              {job.status === 'writing' && (
+                <span className="text-cyan-400 animate-pulse">⟳</span>
+              )}
+            </div>
           ))
         )}
       </div>
 
-      {/* Footer Stats */}
-      <div className="px-4 py-2 bg-gradient-to-t from-[#0a0a12] to-transparent border-t border-white/5">
-        <div className="flex items-center justify-between text-xs font-mono text-gray-500">
-          <span>Total Rows Exported: {stats.totalRows.toLocaleString()}</span>
-          <span>Max Concurrent: {maxConcurrent}</span>
+      {/* Format Info */}
+      <div className="mt-4 pt-3 border-t border-gray-800">
+        <div className="text-[9px] font-mono text-gray-500 mb-2">FORMAT_INFO</div>
+        <div className="grid grid-cols-3 gap-2 text-[9px] font-mono">
+          <div className="p-2 rounded bg-gray-900/50 border border-gray-800">
+            <div className="text-cyan-400 mb-1">PARQUET</div>
+            <div className="text-gray-500">Columnar • Compressed • Fast</div>
+          </div>
+          <div className="p-2 rounded bg-gray-900/50 border border-gray-800">
+            <div className="text-green-400 mb-1">CSV</div>
+            <div className="text-gray-500">Universal • Readable • Large</div>
+          </div>
+          <div className="p-2 rounded bg-gray-900/50 border border-gray-800">
+            <div className="text-purple-400 mb-1">JSON</div>
+            <div className="text-gray-500">Nested • Flexible • Verbose</div>
+          </div>
         </div>
       </div>
     </div>
