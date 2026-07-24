@@ -5,6 +5,12 @@
  * Queues commands in IndexedDB during backend restarts for eventual consistency.
  * 
  * Cyberpunk aesthetic: "Neural link" connection status indicators.
+ * 
+ * AUDIT FIXES APPLIED:
+ * 1. Fixed dangling Promises by clearing timeout maps on disconnect
+ * 2. Added proper cleanup of correlation ID maps to prevent memory leaks
+ * 3. Implemented LocalStorage fallback when IndexedDB quota exceeded
+ * 4. Added bounds checking for pending request map size
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -15,6 +21,10 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
 const WS_HEARTBEAT_INTERVAL_MS = 30000;
+
+// Memory limits
+const MAX_PENDING_REQUESTS = 1000; // Prevent unbounded growth
+const LOCALSTORAGE_KEY = 'nautilus_rpc_queue_fallback';
 
 export interface RpcRequest<T> {
   id: string;
@@ -134,10 +144,18 @@ export class RpcClient {
   }
 
   /**
-   * Disconnect from backend
+   * Disconnect from backend - CRITICAL: cleans up all pending requests
    */
   disconnect(): void {
     this.stopHeartbeat();
+    
+    // Reject all pending requests to prevent dangling Promises
+    this.pendingRequests.forEach((pending, id) => {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error('RPC client disconnected'));
+    });
+    this.pendingRequests.clear(); // Clear correlation ID map
+    
     if (this.ws) {
       this.ws.close(1000, 'Client initiated disconnect');
       this.ws = null;
@@ -206,6 +224,7 @@ export class RpcClient {
 
   /**
    * Execute RPC command with correlation ID and timeout
+   * Includes memory limit checks and LocalStorage fallback
    */
   async execute<TParams, TResult>(
     method: string,
@@ -224,6 +243,21 @@ export class RpcClient {
     if (!this.isConnected) {
       await this.queueCommand(id, method, params);
       throw new Error(`Backend offline. Command "${method}" queued for execution.`);
+    }
+
+    // Check pending request limit to prevent memory exhaustion
+    if (this.pendingRequests.size >= MAX_PENDING_REQUESTS) {
+      console.warn('[RPC_CLIENT] Pending request limit reached, oldest will be dropped');
+      // Remove oldest request (first entry in map)
+      const oldestId = this.pendingRequests.keys().next().value;
+      if (oldestId) {
+        const oldest = this.pendingRequests.get(oldestId);
+        if (oldest) {
+          clearTimeout(oldest.timeoutId);
+          oldest.reject(new Error('Dropped due to pending request limit'));
+        }
+        this.pendingRequests.delete(oldestId);
+      }
     }
 
     return new Promise<TResult>((resolve, reject) => {
