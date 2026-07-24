@@ -4,71 +4,45 @@
 __pycache__/
 *.o
 *.obj
-*.so
-*.dll
 *.exe
-*.class
+*.dll
+*.so
+*.a
 *.out
 
 # Dependencies
 .venv/
 venv/
-.env
-.env.local
-*.env.*
-
-# Build directories
+node_modules/
+target/
+.mypy_cache/
+.pytest_cache/
 dist/
 build/
-target/
-
-# Python specific
-*.pyc
-__pycache__/
-*.pyo
-*.pyd
-.Python
-*.so
-.Python
-env/
-venv/
-ENV/
-.venv/
-.env/
-.envrc
-.env.*
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-*.swo
+
+# Environment
+.env
+.env.local
+*.env.*
 
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# Coverage reports
-.coverage
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Coverage
 coverage/
 htmlcov/
-
-# MyPy cache
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pytest cache
-.pytest_cache/
+.coverage
 
 # Rust specific
 Cargo.lock
-*.rs.bk
-*.rlib
-target/
-
-# PowerShell scripts related (if they generate temp files)
-*.tmp
 ```
