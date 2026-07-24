@@ -1,42 +1,36 @@
 ```
 # Dependencies
 node_modules/
-.pnpm-store/
-.yarn/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
 # Build outputs
 dist/
 build/
-coverage/
-.nyc_output/
-.eslintcache
+*.js
+*.ts
+*.tsx
 
-# Logs
-*.log
-
-# Environment variables
+# Environment
 .env
 .env.local
-.env.*
-!.env.example
+*.env.*
 
-# IDE files
+# Editors
 .vscode/
 .idea/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
+*.tmp
 
-# Python specific
+# Logs
+*.log
+
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
+env/
 venv/
 .venv/
 pip-log.txt
@@ -49,9 +43,27 @@ nosetests.xml
 coverage.xml
 *.cover
 *.log
-.gitattributes
-.next
+.git/
+
+# Node.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+node_modules/
+jspm_packages/
+*.log
+
+# TypeScript
+*.tsbuildinfo
+*.bak
+
+# Web
+public/build/
 out/
-.output
-.hyperupdater
+.next/
+nuxt/dist/
+nuxt/public/
+.nuxt/
+.output/
+.svelte-kit/
 ```

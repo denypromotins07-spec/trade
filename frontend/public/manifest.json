@@ -1,0 +1,63 @@
+{
+  "name": "Nautilus Ray Trading Bot",
+  "short_name": "NautilusRay",
+  "description": "Elite crypto trading bot with AI-driven execution, 3D volatility surfaces, and real-time portfolio optimization.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050510",
+  "theme_color": "#00f3ff",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "/icons/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["finance", "productivity"],
+  "shortcuts": [
+    {
+      "name": "Start Bot",
+      "short_name": "START",
+      "description": "Initialize all Ray workers and start trading strategies",
+      "url": "/?action=start",
+      "icons": [{ "src": "/icons/start-icon.png", "sizes": "96x96" }]
+    },
+    {
+      "name": "Kill Bot",
+      "short_name": "KILL",
+      "description": "Emergency stop: flatten all positions and shutdown workers",
+      "url": "/?action=kill",
+      "icons": [{ "src": "/icons/kill-icon.png", "sizes": "96x96" }]
+    },
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "description": "View real-time PnL and exposure matrix",
+      "url": "/dashboard",
+      "icons": [{ "src": "/icons/dashboard-icon.png", "sizes": "96x96" }]
+    }
+  ],
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "files": [
+        {
+          "name": "reports",
+          "accept": ["application/pdf", "image/png"]
+        }
+      ]
+    }
+  }
+}
