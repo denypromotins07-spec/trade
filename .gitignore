@@ -1,3 +1,44 @@
-# Examples 1:
+```
+# Dependencies
+node_modules/
 
-# Example 2 (Project with artifacts):
+# Build outputs
+dist/
+build/
+.next/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.python-version
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+```
