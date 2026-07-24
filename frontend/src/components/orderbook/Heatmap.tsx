@@ -312,6 +312,40 @@ export const Heatmap: React.FC<HeatmapProps> = ({
     };
   }, [useFallback, renderWebGL, renderCanvas2D]);
 
+  // Cleanup function - CRITICAL: prevents WebGL context loss and VRAM leaks
+  useEffect(() => {
+    return () => {
+      // Cancel animation frame
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+
+      // Clean up WebGL resources to prevent VRAM leaks
+      const gl = glRef.current;
+      const program = programRef.current;
+      const texture = textureRef.current;
+
+      if (gl && program && texture) {
+        // Delete texture to free VRAM
+        gl.deleteTexture(texture);
+        textureRef.current = null;
+
+        // Delete shader program
+        gl.deleteProgram(program);
+        programRef.current = null;
+
+        // Force context loss to ensure complete cleanup
+        const loseContextExt = gl.getExtension('WEBGL_lose_context');
+        if (loseContextExt) {
+          loseContextExt.loseContext();
+        }
+      }
+
+      glRef.current = null;
+      console.log('[HEATMAP] WebGL resources cleaned up, VRAM freed');
+    };
+  }, []);
+
   return (
     <div className="relative">
       <canvas

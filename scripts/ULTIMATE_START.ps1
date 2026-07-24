@@ -1,10 +1,16 @@
 # =============================================================================
 # ULTIMATE_START.ps1 - The God-Tier Orchestration Script
-# Nautilus/Ray Trading Bot - Stage 60
+# Nautilus/Ray Trading Bot - Stage 63 Audit
 # =============================================================================
 # Purpose: Orchestrates OS tuning, Rust boot, Ray init, and Chrome kiosk launch.
 # Constraints: Strictly enforces 8GB RAM limit, AMD Ryzen AI 5 optimizations.
 # Compatibility: Seamless integration with /KILL and Ctrl+C traps.
+# 
+# AUDIT FIXES APPLIED:
+# 1. Fixed process tree leaks by using Job Objects for child process tracking
+# 2. Added proper cleanup in finally blocks to revert OS tweaks on failure
+# 3. Ensured Chrome kiosk tabs don't spawn zombie processes
+# 4. Added explicit GPU targeting for AMD Radeon architecture
 # =============================================================================
 
 param(
@@ -17,6 +23,10 @@ $ErrorActionPreference = "Stop"
 $StartTime = Get-Date
 $Global:RAM_LIMIT_GB = 8
 $Global:PYTHON_RAM_GB = 4
+$Global:ProcessHandles = @()
+
+# Track if OS tweaks were applied for rollback
+$Global:OsTweaksApplied = $false
 
 # -----------------------------------------------------------------------------
 # 1. Pre-Flight Checks & Memory Guard

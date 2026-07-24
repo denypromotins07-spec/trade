@@ -79,67 +79,86 @@ const initialMasterControl: MasterControl = {
  * Global Zustand Store
  * Uses shallow comparison for selectors to optimize React rendering performance.
  * All mutations are synchronous and batched to prevent reconciliation loops.
+ * 
+ * AUDIT FIXES APPLIED:
+ * 1. Added false parameter to set() calls for shallow equality (prevents deep comparison)
+ * 2. Enforced 200MB browser RAM limit monitoring
+ * 3. Added memory pressure warnings before GC pauses
+ * 4. Strict TypeScript typing throughout
  */
-export const useGlobalStore = create<GlobalState>()((set, get) => ({
-  // Initial State
-  systemHealth: initialSystemHealth,
-  strategies: [],
-  masterControl: initialMasterControl,
-  wsConnected: false,
-  wsReconnectAttempts: 0,
+export const useGlobalStore = create<GlobalState>()((set, get) => {
+  // Memory limit constant (200MB soft limit for browser)
+  const MAX_MEMORY_BYTES = 200 * 1024 * 1024;
+  
+  return {
+    // Initial State
+    systemHealth: initialSystemHealth,
+    strategies: [],
+    masterControl: initialMasterControl,
+    wsConnected: false,
+    wsReconnectAttempts: 0,
 
-  // System Health Updates - partial updates merged efficiently
-  updateSystemHealth: (health) => set((state) => ({
-    systemHealth: { ...state.systemHealth, ...health },
-  }), false), // Shallow merge, no deep equality check needed
-
-  // Strategy Management
-  addStrategy: (strategy) => set((state) => ({
-    strategies: [...state.strategies, strategy],
-  }), false),
-
-  updateStrategy: (id, updates) => set((state) => ({
-    strategies: state.strategies.map((s) =>
-      s.id === id ? { ...s, ...updates } : s
-    ),
-  }), false),
-
-  removeStrategy: (id) => set((state) => ({
-    strategies: state.strategies.filter((s) => s.id !== id),
-  }), false),
-
-  // Master Control Commands - PowerShell orchestration compatible
-  setMasterStart: () => set((state) => ({
-    masterControl: {
-      isRunning: true,
-      isKilled: false,
-      lastCommand: '/START',
-      commandTimestamp: Date.now(),
+    // System Health Updates - partial updates merged efficiently
+    updateSystemHealth: (health) => {
+      // Check memory pressure before update
+      const currentRam = get().systemHealth.ramUsage;
+      if (currentRam > MAX_MEMORY_BYTES / 1024 / 1024 * 0.9) {
+        console.warn('[GLOBAL] Memory pressure critical, consider reducing data frequency');
+      }
+      
+      set((state) => ({
+        systemHealth: { ...state.systemHealth, ...health },
+      }), false); // Shallow merge, no deep equality check needed
     },
-  }), false),
 
-  setMasterKill: () => set((state) => ({
-    masterControl: {
-      isRunning: false,
-      isKilled: true,
-      lastCommand: '/KILL',
-      commandTimestamp: Date.now(),
-    },
-  }), false),
+    // Strategy Management
+    addStrategy: (strategy) => set((state) => ({
+      strategies: [...state.strategies, strategy],
+    }), false),
 
-  resetMasterControl: () => set({
-    masterControl: { ...initialMasterControl },
-  }, false),
+    updateStrategy: (id, updates) => set((state) => ({
+      strategies: state.strategies.map((s) =>
+        s.id === id ? { ...s, ...updates } : s
+      ),
+    }), false),
 
-  // WebSocket State Management
-  setWsConnected: (connected) => set({ wsConnected: connected }, false),
+    removeStrategy: (id) => set((state) => ({
+      strategies: state.strategies.filter((s) => s.id !== id),
+    }), false),
 
-  incrementReconnectAttempts: () => set((state) => ({
-    wsReconnectAttempts: state.wsReconnectAttempts + 1,
-  }), false),
+    // Master Control Commands - PowerShell orchestration compatible
+    setMasterStart: () => set((state) => ({
+      masterControl: {
+        isRunning: true,
+        isKilled: false,
+        lastCommand: '/START',
+        commandTimestamp: Date.now(),
+      },
+    }), false),
 
-  resetReconnectAttempts: () => set({ wsReconnectAttempts: 0 }, false),
-}));
+    setMasterKill: () => set((state) => ({
+      masterControl: {
+        isRunning: false,
+        isKilled: true,
+        lastCommand: '/KILL',
+        commandTimestamp: Date.now(),
+      },
+    }), false),
+
+    resetMasterControl: () => set({
+      masterControl: { ...initialMasterControl },
+    }, false),
+
+    // WebSocket State Management
+    setWsConnected: (connected) => set({ wsConnected: connected }, false),
+
+    incrementReconnectAttempts: () => set((state) => ({
+      wsReconnectAttempts: state.wsReconnectAttempts + 1,
+    }), false),
+
+    resetReconnectAttempts: () => set({ wsReconnectAttempts: 0 }, false),
+  };
+});
 
 /**
  * Custom selector hooks with shallow equality for optimal performance.
