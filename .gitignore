@@ -10,22 +10,20 @@ __pycache__/
 *.a
 *.out
 target/
+dist/
+build/
 
 # Dependencies
 .venv/
 venv/
 node_modules/
-.mypy_cache/
-.pytest_cache/
-.coverage
-htmlcov/
-coverage/
+.julia/
+.zig-cache/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-*.swo
 
 # Environment
 .env
@@ -35,11 +33,41 @@ coverage/
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS specific
 .DS_Store
 Thumbs.db
 
-# Rust specific
-Cargo.lock
+# Testing and coverage
+.coverage
+coverage/
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+
+# Archives
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
