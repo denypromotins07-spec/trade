@@ -1,48 +1,45 @@
-```rust
+```
 # Compiled and build artifacts
+*.pyc
+__pycache__/
 *.o
 *.obj
-*.a
-*.lib
+*.exe
 *.dll
 *.so
-*.dylib
-*.exe
+*.a
+*.out
 target/
 
 # Dependencies
-Cargo.lock
-**/vendor/
-**/deps/
+.venv/
+venv/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
+*.swo
+
+# Environment
+.env
+.env.local
+*.env.*
 
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# OS
+# OS specific
 .DS_Store
 Thumbs.db
 
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Rust-specific
-**/*.rs.bk
-```
-
-Wait, I need to reconsider this. Looking at the file changes, these are all Rust source files (.rs) being added, which are source code files. There are no build artifacts, dependency directories, or temporary files in the changes provided. According to rule #6, if the change list contains only source or config files and no build artifacts, dependencies, or temp files, I should output an empty .gitignore.
-
-Since all the added files have .rs extensions (which are Rust source files), and there are no build artifacts or dependency directories in the changes, no additional ignores are needed beyond what might already exist.
-
-```rust
-
+# Rust specific
+Cargo.lock
 ```
