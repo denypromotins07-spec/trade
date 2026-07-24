@@ -1,15 +1,29 @@
 ```
-# Dependencies
-node_modules/
-
-# Build outputs
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
+target/
 dist/
 build/
-.next/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+.julia/
+.zig-cache/
 
 # Logs and temp files
 *.log
 *.tmp
+*.swp
 
 # Environment
 .env
@@ -22,23 +36,38 @@ build/
 *.swp
 *.swo
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-.python-version
+# OS specific
+.DS_Store
+Thumbs.db
 
-# Coverage
+# Testing and coverage
 .coverage
 coverage/
 htmlcov/
+.mypy_cache/
+.pytest_cache/
 
-# OS
-.DS_Store
-Thumbs.db
+# Archives
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
