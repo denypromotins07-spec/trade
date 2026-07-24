@@ -3,8 +3,9 @@
 # =============================================================================
 # Target Architecture: AMD Ryzen AI 5 (Windows x86_64)
 # Optimization Profile: Maximum single-threaded performance with LTO
-# Memory Constraint: 4GB heap budget for execution engine
+# Memory Constraint: 8GB global RAM limit (4GB Python quota)
 # Latency Goal: Sub-10 microsecond hot path execution
+# Stage 54: Final Compilation with PGO and LTO
 # =============================================================================
 
 [workspace]
@@ -12,6 +13,7 @@ resolver = "2"
 members = [
     ".",
     "src/core",
+    "python/ffi",
 ]
 
 [package]
@@ -24,17 +26,43 @@ license = "PROPRIETARY"
 
 # Critical: Enable native CPU optimizations for AMD Ryzen architecture
 [profile.release]
+opt-level = 3                    # Maximum optimization level
+lto = "fat"                      # Full Link Time Optimization across all crates
+codegen-units = 1                # Single codegen unit for maximum inlining
+target-cpu = "native"            # Auto-detect AMD Ryzen features (AVX2, FMA, BMI2)
+panic = "abort"                  # Abort on panic to eliminate unwinding overhead
+strip = true                     # Strip all debug symbols from binary
+rpath = false                    # Disable runtime library path lookup
+debug = false                    # No debug information in release build
+debug-assertions = false         # Disable debug assertions
+overflow-checks = false          # Disable integer overflow checks for speed
+incremental = false              # Disable incremental compilation for clean builds
+
+# PGO instrumentation profile - generates profiling data
+[profile.pgo-instrument]
+inherits = "release"
+instrument = true                # Enable PGO instrumentation
+codegen-units = 1
+lto = "thin"                     # Thin LTO during instrumentation for faster builds
+
+# PGO usage profile - applies generated profiles for optimal code layout
+[profile.pgo-use]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Benchmark profile for micro-benchmarking with rdtscp
+[profile.bench]
 opt-level = 3
-lto = "fat"                    # Full Link Time Optimization for cross-module inlining
-codegen-units = 1              # Single codegen unit enables better optimization
-target-cpu = "native"          # Auto-detect AMD Ryzen features (AVX2, FMA, etc.)
-panic = "abort"                # Abort on panic to avoid unwinding overhead in production
-strip = "symbols"              # Strip debug symbols for smaller binary
-rpath = false                  # Disable runtime library path lookup
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 
 [profile.dev]
 opt-level = 0
-debug = "line-tables-only"     # Minimal debug info for faster compilation
+debug = "line-tables-only"       # Minimal debug info for faster compilation
 target-cpu = "native"
 
 # =============================================================================

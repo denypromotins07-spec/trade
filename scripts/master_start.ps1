@@ -1,23 +1,49 @@
 # =============================================================================
-# Nautilus/Ray Bot - Stage 53: Master Start Orchestrator
-# File: scripts/master_start.ps1
-# Purpose: Ultimate /START PowerShell orchestrator that sequentially boots
-#          stripped OS services, loads pinned memory, starts Ray cluster,
-#          and ignites the Rust engine. Includes safe rollback on /KILL.
-# Target: AMD Ryzen AI 5 / Windows 10/11 IoT Enterprise LTSC
-# Constraints: 8GB RAM Limit, Microsecond Latency Focus
+# NAUTILUS/RAY CRYPTO TRADING BOT - MASTER START ORCHESTRATOR
+# =============================================================================
+# Stage 54: Master /START Orchestrator
+# Purpose: Sequentially initialize AMD OS tweaks, mount huge pages, boot Ray cluster,
+#          and ignite the Rust PGO binary
+# Target: AMD Ryzen AI 5 with 8GB RAM limit
 # =============================================================================
 
+[CmdletBinding()]
 param(
-    [switch]$Kill,
-    [switch]$DryRun,
-    [string]$ConfigPath = "C:\Nautilus\Config\bot_config.json"
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipTweaks,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipRay,
+    
+    [Parameter(Mandatory = $false)]
+    [int]$RamLimitMB = 8192,
+    
+    [Parameter(Mandatory = $false)]
+    [string]$ConfigPath = "config/trading_config.json",
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$Verbose
 )
 
-$ErrorActionPreference = "Stop"
-$LogPath = "C:\Nautilus\Logs\master_start.log"
-$StatePath = "C:\Nautilus\State\bot_state.json"
-$BackupPath = "C:\Nautilus\Backups\System_State"
+# =============================================================================
+# CONFIGURATION CONSTANTS
+# =============================================================================
+$SCRIPT_ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PROJECT_ROOT = Split-Path -Parent $SCRIPT_ROOT
+$LOG_FILE = Join-Path $PROJECT_ROOT "logs/master_start_$((Get-Date).ToString('yyyyMMdd_HHmmss')).log"
+$PID_FILE = Join-Path $PROJECT_ROOT ".pids/master.pids"
+
+# Binary paths
+$RUST_BINARY = Join-Path $PROJECT_ROOT "target/release/nautilus-ray-bot.exe"
+$RAY_START_SCRIPT = Join-Path $PROJECT_ROOT "scripts/start_ray.ps1"
+
+# Memory configuration
+$HUGE_PAGE_SIZE_MB = 2
+$PYTHON_RAM_QUOTA_MB = 4096
+$RUST_RAM_QUOTA_MB = 4096
+
+# Job object name for process group management
+$JOB_OBJECT_NAME = "NautilusRayBot_Main_Job"
 
 # Component Scripts
 $Scripts = @{
