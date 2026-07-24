@@ -4,31 +4,45 @@
 __pycache__/
 *.o
 *.obj
-*.exe
-*.dll
 *.so
-*.a
+*.dll
+*.exe
+*.class
 *.out
-target/
-dist/
-build/
 
 # Dependencies
 .venv/
 venv/
-node_modules/
-.julia/
-.zig-cache/
+.env
+.env.local
+*.env.*
+
+# Build directories
+dist/
+build/
+target/
+
+# Python specific
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+.env/
+.envrc
+.env.*
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
-
-# Environment
-.env
-.env.local
-*.env.*
+*.swo
 
 # Editors
 .vscode/
@@ -36,38 +50,25 @@ node_modules/
 *.swp
 *.swo
 
-# OS specific
-.DS_Store
-Thumbs.db
-
-# Testing and coverage
+# Coverage reports
 .coverage
 coverage/
 htmlcov/
+
+# MyPy cache
 .mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pytest cache
 .pytest_cache/
 
-# Archives
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+# Rust specific
+Cargo.lock
+*.rs.bk
+*.rlib
+target/
+
+# PowerShell scripts related (if they generate temp files)
+*.tmp
 ```

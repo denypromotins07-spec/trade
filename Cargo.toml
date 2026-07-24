@@ -1,164 +1,127 @@
-# =============================================================================
-# NAUTILUS/RAY CRYPTO TRADING BOT - RUST WORKSPACE CONFIGURATION
-# =============================================================================
-# Target Architecture: AMD Ryzen AI 5 (Windows x86_64)
-# Optimization Profile: Maximum single-threaded performance with LTO
-# Memory Constraint: 4GB heap budget for execution engine
-# Latency Goal: Sub-10 microsecond hot path execution
-# =============================================================================
-
-[workspace]
-resolver = "2"
-members = [
-    ".",
-    "src/core",
-]
+# Nautilus/Ray HFT Trading Bot - Stage 54
+# Hyper-strict Rust compilation configuration for microsecond latency
+# Optimized for AMD Ryzen AI 5 architecture with 8GB RAM constraint
 
 [package]
-name = "nautilus-ray-bot"
-version = "0.1.0"
+name = "nautilus_hft"
+version = "5.4.0"
 edition = "2021"
-authors = ["Quantitative Trading Systems"]
-description = "Ultra-low latency crypto trading bot with Ray-distributed AI"
+authors = ["Quantitative Trading Team"]
+description = "Ultra-low latency crypto trading engine with PGO optimization"
 license = "PROPRIETARY"
 
-# Critical: Enable native CPU optimizations for AMD Ryzen architecture
+# =============================================================================
+# PROFILE-GUIDED OPTIMIZATION (PGO) CONFIGURATION
+# =============================================================================
 [profile.release]
+opt-level = 3                    # Maximum optimization level
+lto = "fat"                      # Full Link-Time Optimization across all crates
+codegen-units = 1                # Single codegen unit for maximum inlining
+panic = "abort"                  # Eliminate unwind tables, reduce binary size
+strip = "symbols"                # Strip debug symbols from final binary
+rpath = false                    # Disable runtime library path lookup
+debug = false                    # No debug info in release builds
+debug-assertions = false         # Disable debug assertions
+overflow-checks = false          # Disable integer overflow checks (unsafe but fast)
+incremental = false              # Disable incremental compilation for clean builds
+
+# =============================================================================
+# BENCHMARK PROFILE FOR MICRO-BENCHMARKING WITH rdtscp
+# =============================================================================
+[profile.bench]
 opt-level = 3
-lto = "fat"                    # Full Link Time Optimization for cross-module inlining
-codegen-units = 1              # Single codegen unit enables better optimization
-target-cpu = "native"          # Auto-detect AMD Ryzen features (AVX2, FMA, etc.)
-panic = "abort"                # Abort on panic to avoid unwinding overhead in production
-strip = "symbols"              # Strip debug symbols for smaller binary
-rpath = false                  # Disable runtime library path lookup
-
-[profile.dev]
-opt-level = 0
-debug = "line-tables-only"     # Minimal debug info for faster compilation
-target-cpu = "native"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
 
 # =============================================================================
-# CORE DEPENDENCIES - PINNED VERSIONS FOR REPRODUCIBILITY
+# PGO INSTRUMENTATION PROFILE
+# Used during the profiling phase to collect execution data
 # =============================================================================
+[profile.pgo-instrument]
+inherits = "release"
+pgo = true                       # Enable PGO instrumentation
+codegen-units = 16               # Multiple units for faster instrumentation build
 
+# =============================================================================
+# DEPENDENCIES - Strictly pinned versions for reproducibility
+# =============================================================================
 [dependencies]
-# Nautilus Trader - High-performance algorithmic trading library
-# Pinned to specific commit for stability; update only after thorough testing
-nautilus_trader = { git = "https://github.com/nautechsystems/nautilus_trader.git", tag = "v0.39.0" }
+tokio = { version = "1.35.0", features = ["full"], default-features = false }
+crossbeam = "0.8.4"
+crossbeam-channel = "0.5.11"
+crossbeam-queue = "0.3.11"
+bumpalo = "3.14.0"
+typed-arena = "2.0.2"
+raw-cpuid = "11.0.0"
+chrono = { version = "0.4.31", default-features = false, features = ["clock"] }
+bincode = "1.3.3"
+serde = { version = "1.0.193", features = ["derive"], default-features = false }
+serde_json = { version = "1.0.108", features = ["preserve_order"] }
+socket2 = { version = "0.5.5", features = ["all"] }
+mio = { version = "0.8.10", features = ["os-poll", "net"] }
+tracing = { version = "0.1.40", features = ["max_level_off", "release_max_level_off"] }
+tracing-subscriber = { version = "0.3.18", default-features = false }
+pyo3 = { version = "0.20.0", features = ["extension-module"], optional = true }
+target-lexicon = "0.12.12"
+uuid = { version = "1.6.1", features = ["v4", "fast-rng"], default-features = false }
+memmap2 = "0.9.0"
+atomic-wait = "1.1.0"
 
-# Tokio - Async runtime for non-blocking I/O and timers
-tokio = { version = "1.35", features = [
-    "rt-multi-thread",            # Multi-threaded runtime for parallel task execution
-    "sync",                       # Synchronization primitives (channels, mutexes)
-    "time",                       # High-resolution timers for order timeouts
-    "net",                        # Network I/O for WebSocket connections
-    "macros",                     # Async macros for cleaner code
-    "parking_lot",                # Faster parking lot implementation
-], default-features = false }
-
-# Rayon - Data parallelism for batch processing (offline training data prep)
-rayon = "1.8"
-
-# Crossbeam - Lock-free concurrent data structures for hot path
-crossbeam = { version = "0.8", features = ["crossbeam-channel", "crossbeam-queue"] }
-crossbeam-channel = "0.5"
-
-# Memory-mapped file I/O for zero-copy logging
-memmap2 = "0.9"
-
-# Serialization for inter-process communication
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bincode = "1.3"                    # Faster than serde_json for internal messaging
-
-# High-precision time handling (nanosecond resolution)
-chrono = { version = "0.4", features = ["serde"] }
-time = { version = "0.3", features = ["local-offset"] }
-
-# Error handling with minimal overhead
-thiserror = "1.0"
-anyhow = "1.0"
-
-# Environment variable parsing (compile-time verified)
-dotenvy = "0.15"
-
-# Tracing for structured telemetry (non-blocking)
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Numerical computing (AMD-optimized BLAS via system links)
-ndarray = "0.15"
-blas-src = { version = "0.10", default-features = false }
-
-# Cryptography for API signature generation
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
-base64 = "0.21"
-
-# Memory allocation control
-tikv-jemallocator = { version = "0.5", features = ["unprefixed_malloc_on_supported_platforms"] }
-
-# =============================================================================
-# BUILD DEPENDENCIES - For compile-time code generation
-# =============================================================================
+[dev-dependencies]
+cargo-fuzz = "0.11.2"
+arbitrary = { version = "1.3.2", features = ["derive"] }
+criterion = { version = "0.5.1", features = ["html_reports"] }
 
 [build-dependencies]
-cc = "1.0"                       # C compiler integration for BLAS bindings
-pkg-config = "0.3"               # System library discovery
-
-# =============================================================================
-# PLATFORM-SPECIFIC DEPENDENCIES (Windows)
-# =============================================================================
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = [
-    "winnt",                      # Windows NT types
-    "processthreadsapi",          # Process and thread management
-    "memoryapi",                  # Memory management functions
-    "handleapi",                  # Handle operations
-    "jobapi2",                    # Job objects for process groups
-]}
-
-# =============================================================================
-# FEATURE FLAGS - Conditional compilation for different deployment modes
-# =============================================================================
+vergen = { version = "8.3.1", features = ["git", "rustc", "build"] }
+cc = "1.0.83"
 
 [features]
 default = ["production"]
-
-# Production mode: Maximum optimizations, no debug output
 production = []
+python-ffi = ["dep:pyo3"]
+fuzzing = []
+benchmarking = []
 
-# Paper trading mode: Simulated execution without real orders
-paper_trading = []
+[lib]
+name = "nautilus_hft"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
-# Verbose logging: Enable detailed telemetry (development only)
-verbose_logging = []
+[[bin]]
+name = "nautilus_engine"
+path = "src/main.rs"
 
-# GPU acceleration: Enable DirectML/ROCm bindings for AI inference
-gpu_acceleration = []
+[[bin]]
+name = "pgo_instrument"
+path = "src/pgo_instrument.rs"
+required-features = ["fuzzing"]
 
 # =============================================================================
-# PACKAGE METADATA
+# RUSTC FLAGS - Passed directly to compiler
 # =============================================================================
-
-[package.metadata.windows]
-subsystem = "console"            # Console application for CLI operation
-
-# Linker flags for maximum performance on Windows
-[target.x86_64-pc-windows-msvc]
+[build]
 rustflags = [
-    "-C", "target-feature=+avx2",
-    "-C", "target-feature=+fma",
-    "-C", "target-feature=+bmi2",
-    "-C", "link-arg=/STACK:8388608",  # 8MB stack size
+    "-C", "target-cpu=native",
+    "-C", "llvm-args=-enable-mlir",
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "force-frame-pointers=no",
+    "-C", "merge-all-constants",
+    "-A", "warnings",
 ]
 
-[target.x86_64-pc-windows-gnu]
+[target.x86_64-unknown-linux-gnu]
 rustflags = [
-    "-C", "target-feature=+avx2",
-    "-C", "target-feature=+fma",
-    "-C", "target-feature=+bmi2",
-    "-C", "link-arg=-Wl,--stack,8388608",
+    "-C", "target-cpu=znver4",
+    "-C", "prefer-dynamic",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-cpu=znver4",
+    "-C", "link-arg=/OPT:REF",
+    "-C", "link-arg=/OPT:ICF",
 ]
