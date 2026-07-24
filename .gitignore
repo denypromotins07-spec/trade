@@ -1,40 +1,54 @@
 ```
-# Compiled and build artifacts
-*.o
-*.obj
-*.a
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.ENV
+.python-version
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Build and distribution artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
+.installed.cfg
+lib/
+lib64/
 *.so
 *.dylib
 *.dll
-*.exe
-*.out
 
-# Dependencies
-target/
-**/target/
+# GPU/ML specific
+*.cu.o
+*.ptx
+*.fatbin
 
-# Logs and temp files
+# Logs
 *.log
-*.tmp
-*.swp
+
+# Environment files
+.env
+.env.local
+*.env.*
 
 # Editors
 .vscode/
 .idea/
 *.swp
 *.swo
+*.tmp
 
-# Environment
-.env
-.env.local
-*.env.*
-
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Rust-specific
-Cargo.lock
-**/Cargo.lock
+# OS
+.DS_Store
+Thumbs.db
 ```
